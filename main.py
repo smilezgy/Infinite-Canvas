@@ -4173,6 +4173,19 @@ def extract_image_flexible(value, depth=0):
             return found
     return None
 
+def _log_unparsed_image_response(data, context="生图"):
+    """解析图片失败时打印上游原始响应（截断），便于定位新的返回格式。
+
+    截断长度放宽到 30000：Gemini 系上游会在 parts 里先放一个很长的
+    thoughtSignature（思考签名，单个就有 2000+ 字符），1500 会把真正的
+    图片 part（inlineData/fileData）截掉，导致日志看不出问题所在。
+    """
+    try:
+        snippet = json.dumps(data, ensure_ascii=False)[:30000]
+    except Exception:
+        snippet = str(data)[:30000]
+    print(f"[IMG-PARSE] {context}：未识别到图片，上游原始响应（截断）：{snippet}", flush=True)
+
 def extract_images(data):
     found = []
     seen = set()
@@ -4259,6 +4272,20 @@ def extract_images(data):
                 embedded = image_payload_from_string(part.get("text"))
                 if embedded:
                     add_image(embedded)
+                # Gemini 官方 fileData：部分中转（含 APIMart 的 Gemini 生图）
+                # 把生成图以文件引用返回，而不是 inlineData(base64)：
+                # {"fileData": {"fileUri": "https://.../x.jpg", "mimeType": "image/jpeg"}}
+                file_data = part.get("fileData") or part.get("file_data") or {}
+                if isinstance(file_data, dict):
+                    file_uri = file_data.get("fileUri") or file_data.get("file_uri")
+                    mime_type = file_data.get("mimeType") or file_data.get("mime_type") or ""
+                    if isinstance(file_uri, str) and file_uri.startswith(("http://", "https://")):
+                        if not mime_type or str(mime_type).startswith("image/"):
+                            add_image({
+                                "type": "url",
+                                "value": file_uri,
+                                "mime_type": str(mime_type) or "image/jpeg",
+                            })
 
     current = data
     if isinstance(current, dict) and isinstance(current.get("data"), dict) and isinstance(current["data"].get("result"), dict):
@@ -4281,6 +4308,7 @@ def extract_images(data):
         collect(data["data"]["data"])
     if found:
         return found
+    _log_unparsed_image_response(data, "extract_images")
     raise HTTPException(status_code=502, detail="无法识别生图接口返回格式")
 
 def extract_image(data):
@@ -4312,6 +4340,18 @@ def extract_image(data):
                         "value": value,
                         "mime_type": inline.get("mimeType") or inline.get("mime_type") or "image/png",
                     }
+                # Gemini 官方 fileData（生成图以文件引用返回）
+                file_data = part.get("fileData") or part.get("file_data") or {}
+                if isinstance(file_data, dict):
+                    file_uri = file_data.get("fileUri") or file_data.get("file_uri")
+                    mime_type = file_data.get("mimeType") or file_data.get("mime_type") or ""
+                    if isinstance(file_uri, str) and file_uri.startswith(("http://", "https://")):
+                        if not mime_type or str(mime_type).startswith("image/"):
+                            return {
+                                "type": "url",
+                                "value": file_uri,
+                                "mime_type": str(mime_type) or "image/jpeg",
+                            }
     if isinstance(data.get("data"), dict) and isinstance(data["data"].get("result"), dict):
         data = data["data"]
     if isinstance(data.get("result"), dict):
@@ -4330,6 +4370,7 @@ def extract_image(data):
         data = data["data"]["data"]
     images = data.get("data") or []
     if not isinstance(images, list) or not images:
+        _log_unparsed_image_response(data, "extract_image(no-list)")
         raise HTTPException(status_code=502, detail="生图接口没有返回图片数据")
     first = images[0]
     if first.get("url"):
@@ -4339,6 +4380,7 @@ def extract_image(data):
     flexible = extract_image_flexible(first)
     if flexible:
         return flexible
+    _log_unparsed_image_response(first, "extract_image(first-item)")
     raise HTTPException(status_code=502, detail="无法识别生图接口返回格式")
 
 def extract_task_id(data):
@@ -9936,28 +9978,79 @@ def gemini_reference_part(ref):
         return {"fileData": {"mimeType": "image/png", "fileUri": value}}
     return None
 
+def gemini_candidate_text(raw):
+    """从 Gemini 响应中提取模型文本回复（对话式模型可能在出图前先给文本引导）。"""
+    candidates = raw.get("candidates") if isinstance(raw, dict) else None
+    if not isinstance(candidates, list):
+        return ""
+    parts = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        content = candidate.get("content") or {}
+        content_parts = content.get("parts") if isinstance(content, dict) else None
+        if not isinstance(content_parts, list):
+            continue
+        for part in content_parts:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                parts.append(part["text"])
+    return "\n".join(parts).strip()
+
 async def generate_gemini_provider_image(prompt, size, model, reference_images=None, provider=None):
     model_name = gemini_model_name(model)
     endpoint = gemini_endpoint_url(provider, model_name)
-    parts = [{"text": prompt.strip()}]
+    user_parts = [{"text": prompt.strip()}]
+    reference_uris = set()
     for ref in (reference_images or [])[:ONLINE_IMAGE_REFERENCE_MAX]:
         part = gemini_reference_part(ref)
         if part:
-            parts.append(part)
-    body = {
-        "contents": [{"role": "user", "parts": parts}],
-        "generationConfig": {
-            "responseModalities": ["TEXT", "IMAGE"],
-            "imageConfig": gemini_image_config(size),
-        },
-    }
-    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20.0, read=1800.0, write=120.0, pool=20.0)) as client:
-        response = await client.post(endpoint, headers=api_headers(provider=provider), json=body)
-        response.raise_for_status()
-        # APIMart wraps the native Gemini body in {code, data}; unwrap it before
-        # image extraction so candidates[].content.parts[].inlineData is visible.
-        raw = unwrap_apimart_response(response.json()) if is_apimart_provider(provider) else response.json()
-        return extract_image(raw), raw
+            user_parts.append(part)
+            # 参考图是远端 URL 时会以 fileData 形式发出（见 gemini_reference_part），
+            # 部分中转会把请求里的 fileData 原样回显，取图时要排除掉。
+            ref_file_data = part.get("fileData") if isinstance(part, dict) else None
+            if isinstance(ref_file_data, dict) and ref_file_data.get("fileUri"):
+                reference_uris.add(str(ref_file_data["fileUri"]))
+    contents = [{"role": "user", "parts": user_parts}]
+    # gemini-3-pro-image 等对话式生图模型第一轮常只返回文本引导（如“请提供产品描述”），
+    # 图片要在后续轮次才给出；这里自动续聊最多 GEMINI_IMAGE_MAX_ROUND 轮，直到拿到图片。
+    max_rounds = 3
+    last_raw = {}
+    for _round in range(max_rounds):
+        body = {
+            "contents": contents,
+            "generationConfig": {
+                "responseModalities": ["TEXT", "IMAGE"],
+                "imageConfig": gemini_image_config(size),
+            },
+        }
+        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20.0, read=1800.0, write=120.0, pool=20.0)) as client:
+            response = await client.post(endpoint, headers=api_headers(provider=provider), json=body)
+            response.raise_for_status()
+            # APIMart wraps the native Gemini body in {code, data}; unwrap it before
+            # image extraction so candidates[].content.parts[].inlineData is visible.
+            last_raw = unwrap_apimart_response(response.json()) if is_apimart_provider(provider) else response.json()
+            try:
+                found_images = [
+                    image for image in extract_images(last_raw)
+                    if not (
+                        image.get("type") == "url"
+                        and str(image.get("value") or "") in reference_uris
+                    )
+                ]
+            except HTTPException:
+                found_images = []
+            if found_images:
+                return found_images[0], last_raw
+        if _round >= max_rounds - 1:
+            break
+        # Gemini 2.5 系中转第一轮可能只返回思考 part（thoughtSignature）且丢掉文本，
+        # 此时不能直接放弃：回填占位文本后继续追一轮，明确要求直接出图。
+        model_text = gemini_candidate_text(last_raw) or "（上一轮未返回图片，请直接输出图片。）"
+        # 把本轮模型文本回填进对话，并明确要求直接出图
+        contents.append({"role": "model", "parts": [{"text": model_text}]})
+        contents.append({"role": "user", "parts": [{"text": "请直接输出图片，不要返回任何文字。"}]})
+    _log_unparsed_image_response(last_raw, "gemini")
+    raise HTTPException(status_code=502, detail="gemini 生图接口仅返回文本、多次对话后仍未返回图片数据")
 
 def volcengine_endpoint_url(provider):
     return provider_endpoint_url(provider, "image_generation_endpoint", "/api/v3/images/generations")

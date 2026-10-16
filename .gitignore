@@ -28,3 +28,16 @@ _self_restart.sh
 # 系统文件
 .DS_Store
 Thumbs.db
+
+# 内置 Python 运行时（pip 安装依赖时产生，不进仓库）
+python/Lib/
+python/Scripts/
+python/include/
+
+# 临时文件与本地工具配置
+tmp/
+reasonix.toml
+
+# 本地备份文件（改动前的手工备份）
+*.bak
+*.bak-*
