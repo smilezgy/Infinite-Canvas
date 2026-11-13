@@ -538,5 +538,53 @@ Invalid size '512x512'. Requested resolution is below the current minimum pixel 
 | 输出格式核对 | 同一请求返回 PNG，`ignored_params = ['size', 'output_format']`，日志「平台未采纳 output_format=svg，实际返回 png」 |
 | edits 回归 | 1024x1024 + 参考图 + complexity → 200，multipart 正常 |
 
+## 十三、区分「平台静默忽略」与「我们主动降级」
+
+### 问题
+
+上一节把「平台静默忽略 `output_format`」也写进了 `ignored_params`，前端统一提示：
+
+> 该平台对「输出格式」有额外限制（可能把模型映射到了能力更少的版本），本次已自动调整该设置，其余参数照常生效。
+
+这句文案有**两处不准确**：
+
+1. 「自动调整了设置」—— 平台静默忽略时我们**什么都没调**，只是事后核对发现产物不对；
+2. 「其余参数照常生效」—— 掩盖了真正的事实：**用户选的格式没生效，拿到的是别的东西**。
+
+### 实测平台行为又变了
+
+同一平台（`newapi.lkkcdn.com`），key 分组不同，行为不同：
+
+| 请求 | 行为 |
+|---|---|
+| `output_format=webp` | 200，**返回真 WebP**（文件头 `RIFF....WEBP`，1.0 MB） |
+| `output_format=svg` | 400 `SVG output is not available in this key's group (per-call route). Create a key with OpenAI Official as its group ...` |
+
+即：此前「平台静默丢弃 output_format」的结论**已过期**，那是旧 key 分组的行为；现在 WebP 可用，SVG 则**明确报错且不给参数名**——一个参数名都没有，`unsupported_request_params()` 的五条正则全都匹配不上，降级机制直接失效，400 原样抛给用户。
+
+### 改动
+
+| 改动 | 说明 |
+|---|---|
+| `_FORMAT_VALUE_UNSUPPORTED_PATTERNS` | 新增按**格式值**识别的规则：`svg/gif/webp + output/format/image + not available/unsupported` → 映射回 `output_format` |
+| `unsupported_params` | 新字段，只记「平台收下请求却不执行」（静默忽略）；`ignored_params` 只记「上游拒绝、我们剔除后重试」 |
+| `requested_format` / `actual_format` | 如实记录所选格式与实际产物格式，前端据此说明「选了 SVG，实际返回 PNG」 |
+| `REJECTED_OUTPUT_FORMATS` | 拒绝缓存改为**按格式值**记录（键含 format），修掉「拒过 SVG 就永久禁掉整个 `output_format`」的污染 |
+| `friendly_image_error_detail()` | 输出格式不被支持时给专门文案：说明限制来自 **API Key 分组权限**，并给出「改用 PNG/WebP」或「切换 Key 分组」两条可执行建议 |
+| 前端 `unsupportedNotice()` / `ignoredNotice()` | 拆成两条文案：静默忽略说清实际产物；主动降级说清改用了默认格式 |
+
+### 验证
+
+| 项 | 结果 |
+|---|---|
+| 格式值识别单测 | 真实 SVG 报文、WEBP/GIF 变体均能识别；尺寸下限、GIF 拼版超限等报文**不误判**；白名单外不返回 |
+| 四路径分类 | 静默忽略 → `unsupported_params`；上游拒 complexity → `ignored_params`；上游拒 svg → `ignored_params` 且 `unsupported_params` 为空；格式一致 → 两者皆空 |
+| 拒绝缓存隔离 | 拒过 svg 后，webp / png 请求仍照常携带 `output_format`，不再被误伤 |
+| 真实平台 | svg → 200（自动降级为 png，`ignored_params=['output_format']`）；**随后** webp → 200 且落盘真 WebP、`ignored_params=[]`；png → 200 无任何标记 |
+| 前端文案 | 无头浏览器驱动，四种场景文案与预期一致 |
+
+> 计数：本次排障向该平台发了 6 次请求，6 次成功出图（计费）。
+
+
 
 
