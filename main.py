@@ -9980,39 +9980,48 @@ def gif_frame_budget_fix(text, params):
 
 
 def gif_size_budget_fix(text, size):
-    """GIF 拼版超出平台像素预算时，按报文反推出能放得下的单帧尺寸。
+    """GIF 拼版超出平台限制时，按报文反推出能放得下的单帧尺寸。
 
-    实测报文：
+    实测报文（newapi 类中转，两种措辞）：
         "No supported sheet fits 9 GIF frames at size '1024x1024'.
          Invalid size '3072x3072'. Requested resolution exceeds the current pixel budget."
-    平台把每帧放大到请求尺寸后按 factor×factor 拼成 sheet（这里是 3×3），
-    3072x3072 = 943 万像素超过 GPT Image 约 829 万的预算。
-    反推 factor 后即可算出能放得下的单帧边长：829 万 / 9 ≈ 92 万 → 944px。
+        "No supported sheet fits 4 GIF frames at size '1024x1024'.
+         Invalid size '2048x2048'. The longest edge must be less than or equal to 3840.
+         Invalid size '2048x4096'. ..."
+    平台把每帧放大到请求尺寸再按 factor×factor 拼成 sheet，报文里会列出它尝试过的
+    候选拼版尺寸。取**面积最小**的那个候选（最接近可行值），留 25% 余量后反推单帧上限：
+        9 帧 @1024 → 候选 3072x3072 → 2304 → 单帧 768
+        4 帧 @1024 → 候选 2048x2048 → 1536 → 单帧 768
+    实测该平台单帧长边必须 < 1024（912 可行、1024 不行），768 稳妥。
 
     实测该平台还会**静默忽略** frame_count（传 2 仍按 9 帧拼），
     所以真正能救 GIF 的变量是尺寸，不是帧数。
     400 表示请求被拒、尚未生成也不计费，重试是安全的。
     """
     lower = str(text or "").lower()
-    if "gif" not in lower or "pixel budget" not in lower:
+    if "gif" not in lower:
         return None
-    m = re.search(r"invalid size '(\d{2,5})x(\d{2,5})'", lower)
-    if not m:
+    if "pixel budget" not in lower and "longest edge" not in lower:
         return None
-    sheet_w, sheet_h = int(m.group(1)), int(m.group(2))
     width, height = parse_size_pair(size)
-    if not width or not height or not sheet_w or not sheet_h:
+    if not width or not height:
         return None
-    factor_w = max(1, round(sheet_w / width))
-    factor_h = max(1, round(sheet_h / height))
-    budget = GPT_IMAGE2_MAX_PIXELS / float(factor_w * factor_h)
-    # 留 5% 余量：算出来的值往往正好卡在预算上限（960→拼版 2880² 恰好等于上限），
-    # 平台按「超过」判定时仍会拒，余量能一次过。
-    side = int((budget ** 0.5) * 0.95 // 16 * 16)
+    candidates = [(int(a), int(b)) for a, b in re.findall(r"invalid size '(\d{2,5})x(\d{2,5})'", lower)]
+    if candidates:
+        sheet_w, sheet_h = min(candidates, key=lambda item: item[0] * item[1])
+        factor_w = max(1, round(sheet_w / width))
+        factor_h = max(1, round(sheet_h / height))
+        limit_w = int(sheet_w * 0.75) // 16 * 16
+        limit_h = int(sheet_h * 0.75) // 16 * 16
+        side = min(limit_w // factor_w, limit_h // factor_h)
+    else:
+        # 没有候选尺寸时退回像素预算估算
+        side = int((GPT_IMAGE2_MAX_PIXELS ** 0.5) * 0.95 // 16 * 16)
+    side = max(16, (side // 16) * 16)
     new_width = max(16, (min(width, side) // 16) * 16)
     new_height = max(16, (min(height, side) // 16) * 16)
     if new_width == width and new_height == height:
-        # 按当前尺寸反推仍然超预算：直接再缩 25%
+        # 按当前尺寸反推仍然超限：直接再缩 25%
         new_width = max(16, (width * 3 // 4 // 16) * 16)
         new_height = max(16, (height * 3 // 4 // 16) * 16)
         if new_width == width and new_height == height:
@@ -11867,6 +11876,8 @@ async def generate_runninghub_video(payload, provider):
 
 async def generate_ai_image(prompt, size, quality, model, reference_images=None, provider_id="comfly", aspect_ratio="", resolution="", output_options=None, notes=None):
     provider = get_api_provider(provider_id)
+    # 实际生效的请求参数（含被自动降级后的最终值，例如 GIF 自动缩小的尺寸）
+    applied_params = {}
     # 该平台/模型此前明确拒绝过的可选参数，直接不再发送，省掉一次注定失败的请求。
     rejected = known_rejected_params(provider_id, model)
     if rejected and output_options:
@@ -12042,10 +12053,11 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
                 return await client.post(gen_url, headers=api_headers(provider=provider, model=model), json=params)
 
             # 部分中转不透传 background / output_format 等新参数，按报错点名的字段逐个剔除后重试。
-            response, dropped, _applied = await send_with_optional_param_retry(
+            response, dropped, applied = await send_with_optional_param_retry(
                 _send_apimart, body, OPTIONAL_IMAGE_PARAMS,
                 provider_id=provider["id"], model=model, label=f"APIMart {model}",
             )
+            applied_params = applied
             note_ignored_params(notes, dropped)
         elif is_gpt2 and not image_refs and not mask_refs:
             body = {"model": model, "prompt": prompt, "size": size}
@@ -12060,6 +12072,7 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
                 _send_gpt_gen, body, OPTIONAL_IMAGE_PARAMS,
                 provider_id=provider["id"], model=model, label=f"生图 {model}",
             )
+            applied_params = applied
             note_ignored_params(notes, dropped)
             if response.status_code >= 400 and images_api_unsupported(response):
                 # 回退到 edits 时沿用实际生效的参数，避免又把刚被拒的字段发一遍。
@@ -12098,10 +12111,11 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
                         fh.close()
 
             try:
-                response, dropped, _applied = await send_with_optional_param_retry(
+                response, dropped, applied = await send_with_optional_param_retry(
                     _send_edit, default_edit_params(), OPTIONAL_IMAGE_PARAMS,
                     provider_id=provider["id"], model=model, label=f"编辑 {model}",
                 )
+                applied_params = applied
                 note_ignored_params(notes, dropped)
                 if response.status_code >= 400:
                     edit_failed_status = response.status_code
@@ -12152,6 +12166,9 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
             flush=True,
         )
         raw = response.json()
+        # 把实际生效的参数带出去，历史里要记最终尺寸而不是用户请求的那个
+        if isinstance(raw, dict) and applied_params:
+            raw["_applied_params"] = applied_params
         try:
             return extract_image(raw), raw
         except HTTPException as exc:
@@ -14805,6 +14822,9 @@ async def build_online_image_result(payload: OnlineImageRequest):
     local_urls = [url for urls, _items, _raw in generated for url in (urls or []) if url]
     local_items = [item for _urls, items, _raw in generated for item in (items or []) if item.get("url")]
     raw = generated[0][2] if generated else {}
+    # 实际生效的参数：GIF 场景可能被自动缩小过尺寸，这里以生效值为准记录
+    applied = raw.get("_applied_params") if isinstance(raw, dict) else None
+    effective_size = (applied or {}).get("size") or request_size
     if not local_urls:
         provider_name = provider.get("name") or provider["id"]
         raw_text = json.dumps(raw, ensure_ascii=False)[:800] if isinstance(raw, (dict, list)) else str(raw)[:800]
@@ -14820,7 +14840,7 @@ async def build_online_image_result(payload: OnlineImageRequest):
         "provider_name": provider.get("name") or provider["id"],
         "task_id": extract_task_id(raw) if isinstance(raw, dict) else None,
         "request_id": raw.get("id") if isinstance(raw, dict) else None,
-        "params": {"provider_id": provider["id"], "model": model, "size": request_size, "requested_size": payload.size, "quality": payload.quality, "n": count, "reference_images": refs, "output_options": output_options, "ignored_params": ignored_params},
+        "params": {"provider_id": provider["id"], "model": model, "size": effective_size, "requested_size": payload.size, "quality": payload.quality, "n": count, "reference_images": refs, "output_options": output_options, "ignored_params": ignored_params},
         "raw_usage": raw.get("usage") if isinstance(raw, dict) else None,
     }
     save_to_history(result)
