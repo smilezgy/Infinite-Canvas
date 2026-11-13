@@ -321,3 +321,71 @@ base64 图片的 JSON 动辄 2~4MB，正好是最容易被中间设备掐掉的�
 | 第一次声明 3.15MB 只发 11KB 后断开，第二次正常 | 自动重发，**0.17s 拿到图**，POST 次数 2 |
 | 两次都在同一位置断开 | 不再重试，返回中文提示：`只收到 11,321 / 3,150,013 字节（0.4%）…` |
 | 非传输类异常（如 connect timeout） | `transport_error_detail` 返回空串，仍走原来的通用文案 |
+
+---
+
+## 十二、gpt-image-2.6 接入（2026-11-13）
+
+> 依据官方 API reference 核对：`developers.openai.com/api/reference/resources/images/methods/generate`
+> 与 `.../methods/edit`。第三方博客里的 `resolution` / `aspect_ratio` / 16 档比例等说法**不是** OpenAI Images API 的参数，未采纳。
+
+### 官方新增能力
+
+| 项 | 官方取值 | 说明 |
+|---|---|---|
+| 模型 ID | `gpt-image-2.6-sunburst` / `gpt-image-2.6-flare` | 与 2.5 同构，Flare 偏速度、Sunburst 偏细节与编辑一致性 |
+| `complexity` | `low` / `medium` / `high`（默认 high） | **2.5/2.6 新增**：渲染前的规划量，与 `quality` 相互独立 |
+| `quality` | 新增 `xhigh` / `max` | 原 low/medium/high 保留 |
+| `output_format` | 新增 `svg` / `gif` | 矢量图与动态图；编辑端同样列出，但 GIF 不支持 mask |
+| GIF 帧控制 | `frame_count` 2–16（默认 9）、`frame_duration_ms` ≥20（默认 200） | 仅 `output_format=gif` 时有效 |
+| SVG 约束 | 必须 `n=1`；不支持流式、`partial_images`、`output_compression` | 需 `svg.model` 权限，未接入 |
+| `markup` | 编辑端透明 PNG 标注层，与 `mask` 互斥 | 需前端上传标注层，本轮未做 |
+| `safety_identifier` | ≤128 字符，替代已弃用的 `user` | 本地单人工具未接入 |
+| `input_fidelity` | edits 参考把 **gpt-image-2 标注为「必须省略」**，2.5/2.6 亦未提供 | 本次改为**不再发送** |
+| Responses API | 不支持 2.6 | 2.6 必须走 Images API |
+
+### 改动清单
+
+**后端 `main.py`**
+
+| 改动 | 说明 |
+|---|---|
+| `gpt_image_output_options()` | 支持 `svg`/`gif` 格式、`complexity`、`frame_count`、`frame_duration_ms`；透明背景只允许 png/webp（选 jpeg/gif/svg 自动纠正为 png）；svg/gif 不带 `output_compression` |
+| `is_gpt_image_new_series()` | 判定 2.5 / 2.6 系列（含 `/text-to-image` 这类子路径写法） |
+| `gpt_image_supports_input_fidelity()` | gpt-image-2 及以后一律不发 `input_fidelity`，从根上避免 400 |
+| `quality` 白名单 | 放开 `xhigh` / `max` |
+| `OPTIONAL_IMAGE_PARAMS` | 增加 `complexity` / `frame_count` / `frame_duration_ms`，继续走「按上游报错精确降级」 |
+| `sniff_image_extension()` | 支持 SVG（文本，按根标签识别）；GIF 原本已支持 |
+| `build_online_image_result()` | SVG 输出强制 `n=1`（官方要求） |
+
+**前端 `static/online.html`**
+
+- 输出分组新增：复杂度下拉、GIF 帧数、GIF 帧时长
+- 格式下拉新增 SVG / GIF（仅 2.5/2.6 系列可见，其余模型自动隐藏并回落）
+- 质量下拉新增 xhigh / max（仅 2.5/2.6 系列可见）
+- 编辑保真对 gpt-image-2 及以后隐藏（官方已移除该字段）
+- 选 SVG 时数量自动锁定为 ×1
+
+**前端 `static/js/canvas.js`**
+
+- 画布生图节点的质量档放开 `xhigh` / `max`（原先会被重置为 auto）
+
+### 验证记录
+
+| 项 | 结果 |
+|---|---|
+| 纯函数单测 | 29/29 通过（参数组装、系列判定、格式纠正、后缀嗅探） |
+| 假上游端到端 | 上游实收 body 含 `complexity` / `frame_count` / `frame_duration_ms` / `output_format=gif` / `quality=xhigh`，且**不含** `input_fidelity` |
+| 降级重试 | 假上游回 `does not support the 'complexity' parameter` → 自动剔除后重试成功，其它参数保留，notes 记录被忽略项 |
+| 落盘后缀 | SVG → `.svg`、GIF → `.gif`，文件内容与后缀一致 |
+| 接口回归 | `/`、`/api/config`、`/api/history`、`/api/storage-settings`、`/api/tasks`、`/api/stats/overview`、`/api/image-params` 均 200；`/api/queue_status` 422 属缺 `client_id` 的既有行为 |
+| 页面渲染 | 无头浏览器驱动 `setModel('gpt-image-2.6-flare')`：复杂度/GIF 字段按预期显隐；切回 `gpt-image-2` 后 SVG/GIF/xhigh/max 全部隐藏、格式回落为空 |
+
+> 未做真实出图（会消耗真实额度），SVG/GIF 的实际产物需要你在自己的平台跑一次确认。
+
+### 本轮未覆盖
+
+- `markup` 标注层编辑（需前端上传标注 PNG，与 mask 互斥）
+- `svg.model` / `svg.reasoning.effort`（需 SVG 模型选择权限）
+- `safety_identifier`、`moderation`、`partial_images`
+- 画布节点里的输出格式/背景/复杂度控件（画布当前只透传 quality，未接 gpt-image 输出控制，2.0 时代同样缺失）

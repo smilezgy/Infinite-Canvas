@@ -827,7 +827,8 @@ function defaultApiImageResolution(model){
 }
 function normalizedImageQuality(value){
     const quality = String(value || 'auto').trim().toLowerCase();
-    return ['low','medium','high'].includes(quality) ? quality : '';
+    // xhigh / max 是 gpt-image-2.5 / 2.6 新增的质量档
+    return ['low','medium','high','xhigh','max'].includes(quality) ? quality : '';
 }
 function resolveChatModel(value, providerId=''){
     const providerModels = providerId ? providerChatModels(providerId) : [];
@@ -8341,6 +8342,8 @@ function renderGeneratorBody(node){
                     <option value="low">Q low</option>
                     <option value="medium">Q med</option>
                     <option value="high">Q high</option>
+                    <option value="xhigh">Q xhigh</option>
+                    <option value="max">Q max</option>
                 </select>
                 <div class="gen-count-row">
                     <div class="gen-stepper">
@@ -8418,7 +8421,7 @@ function renderGeneratorBody(node){
     const referenceImages = ordered.flatMap(src => src.refs || []);
     const syncQualityControls = () => {
         qualitySelect.disabled = false;
-        if(!['auto','low','medium','high'].includes(String(node.quality || 'auto'))) node.quality = 'auto';
+        if(!['auto','low','medium','high','xhigh','max'].includes(String(node.quality || 'auto'))) node.quality = 'auto';
         qualitySelect.value = node.quality || 'auto';
     };
     const hydrateCustomParts = () => {

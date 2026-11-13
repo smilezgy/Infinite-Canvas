@@ -139,6 +139,8 @@
                                 <option value="low" data-i18n="online.qualityLow">低</option>
                                 <option value="medium" data-i18n="online.qualityMedium">中</option>
                                 <option value="high" data-i18n="online.qualityHigh">高</option>
+                                <option value="xhigh" class="new-series-only" style="display:none">超高</option>
+                                <option value="max" class="new-series-only" style="display:none">最大</option>
                             </select>
                         </label>
                         <label id="countField" class="size-field">
@@ -206,10 +208,41 @@
                                     <option value="png">格式：PNG</option>
                                     <option value="jpeg">格式：JPEG</option>
                                     <option value="webp">格式：WebP</option>
+                                    <option value="gif" class="new-series-only" style="display:none">格式：GIF（动图）</option>
+                                    <option value="svg" class="new-series-only" style="display:none">格式：SVG（矢量）</option>
                                 </select>
                             </label>
                         </div>
                         <div class="size-row" style="margin-top:8px;">
+                            <label class="size-field" id="complexityField" style="display:none">
+                                <select id="complexitySelect" class="size-select" onchange="setComplexity(this.value)" title="复杂度">
+                                    <option value="">复杂度：默认</option>
+                                    <option value="low">复杂度：低（快）</option>
+                                    <option value="medium">复杂度：中</option>
+                                    <option value="high">复杂度：高（规划更细）</option>
+                                </select>
+                            </label>
+                            <label class="size-field" id="gifFrameField" style="display:none">
+                                <select id="frameCountSelect" class="size-select" onchange="setFrameCount(this.value)" title="GIF 帧数">
+                                    <option value="9">GIF 帧数：9</option>
+                                    <option value="4">GIF 帧数：4</option>
+                                    <option value="6">GIF 帧数：6</option>
+                                    <option value="12">GIF 帧数：12</option>
+                                    <option value="16">GIF 帧数：16</option>
+                                </select>
+                            </label>
+                        </div>
+                        <div class="size-row" style="margin-top:8px;">
+                            <label class="size-field" id="gifDurationField" style="display:none">
+                                <select id="frameDurationSelect" class="size-select" onchange="setFrameDuration(this.value)" title="GIF 帧时长">
+                                    <option value="200">帧时长：200ms</option>
+                                    <option value="100">帧时长：100ms</option>
+                                    <option value="50">帧时长：50ms</option>
+                                    <option value="20">帧时长：20ms</option>
+                                    <option value="500">帧时长：500ms</option>
+                                    <option value="1000">帧时长：1000ms</option>
+                                </select>
+                            </label>
                             <label class="size-field" id="compressionField" style="display:none">
                                 <span class="size-pair" style="display:grid;grid-template-columns:1fr auto;align-items:center;gap:8px;">
                                     <input id="compressionRange" type="range" min="0" max="100" step="5" value="90" oninput="setCompression(this.value)" style="width:100%;accent-color:#111827;">
@@ -452,9 +485,32 @@
         function setQuality(next){ quality = next || 'auto'; }
         function setCount(next){ outputCount = Math.max(1, Math.min(4, parseInt(next, 10) || 1)); }
 
-        // ---- gpt-image-2 输出控制：透明背景 / 格式 / 压缩 / 编辑保真 ----
+        // ---- gpt-image-2 / 2.6 输出控制：透明背景 / 格式 / 压缩 / 复杂度 / GIF / 编辑保真 ----
         let outputFormat = '', outputBackground = '', outputCompression = 90, inputFidelity = '';
+        let outputComplexity = '', frameCount = 9, frameDurationMs = 200;
         function isGptImageModel(name){ return /gpt-image/i.test(String(name || '')); }
+        // gpt-image-2.5 / 2.6 系列：官方新增 complexity 与 xhigh/max 质量档，
+        // 并支持 SVG（矢量）与 GIF（动图）输出。判定规则与后端 is_gpt_image_new_series 保持一致。
+        function isGptImageNewSeries(name){
+            const raw = String(name || '').trim().toLowerCase();
+            const normalized = raw.replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+            const compact = raw.replace(/[^a-z0-9]+/g, '');
+            const dashTags = ['gpt-image-2-5', 'gpt-image-2-6'];
+            for(const tag of dashTags){
+                if(normalized.startsWith(tag + '-') || normalized.includes('-' + tag + '-') || normalized.endsWith('-' + tag)) return true;
+            }
+            const compactTags = ['gptimage25', 'gptimage26'];
+            for(const tag of compactTags){
+                if(compact.startsWith(tag) || compact.includes('-' + tag + '-') || compact.endsWith('-' + tag)) return true;
+            }
+            return false;
+        }
+        // input_fidelity 只在早期 gpt-image-1.x 仍可用；
+        // 官方把 gpt-image-2 标注为「必须省略」，2.5 / 2.6 同样未提供。
+        function gptImageSupportsFidelity(name){
+            const compact = String(name || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '');
+            return !compact.startsWith('gptimage2');
+        }
 
         function updateOutputPanel(){
             const box = document.getElementById('outputField');
@@ -462,11 +518,15 @@
             const gpt = isGptImageModel(selectedModel);
             box.style.display = gpt ? '' : 'none';
             if(!gpt) return;
-            // 透明背景只支持 png / webp：选了 jpeg 时自动切回 png
-            if(outputBackground === 'transparent' && outputFormat === 'jpeg'){
+            const newSeries = isGptImageNewSeries(selectedModel);
+            // SVG / GIF 输出只有 2.5 / 2.6 系列支持，其余模型隐藏这两个选项
+            document.querySelectorAll('#formatSelect option.new-series-only').forEach(opt => {
+                opt.style.display = newSeries ? '' : 'none';
+            });
+            if(!newSeries && (outputFormat === 'gif' || outputFormat === 'svg')) outputFormat = '';
+            // 透明背景只支持 png / webp：选了其它格式时自动切回 png
+            if(outputBackground === 'transparent' && outputFormat && !['png','webp'].includes(outputFormat)){
                 outputFormat = 'png';
-                const fmt = document.getElementById('formatSelect');
-                if(fmt) fmt.value = 'png';
             }
             const fmtSel = document.getElementById('formatSelect');
             if(fmtSel) fmtSel.value = outputFormat;
@@ -479,12 +539,47 @@
             if(compRange) compRange.value = String(outputCompression);
             const compLabel = document.getElementById('compressionLabel');
             if(compLabel) compLabel.textContent = String(outputCompression);
-            // 编辑保真只在带了参考图时才有意义
+            // 复杂度是 2.5 / 2.6 系列的新参数，其它模型不显示
+            const cplxField = document.getElementById('complexityField');
+            if(cplxField) cplxField.style.display = newSeries ? '' : 'none';
+            const cplxSel = document.getElementById('complexitySelect');
+            if(cplxSel) cplxSel.value = outputComplexity;
+            // GIF 帧参数只在 GIF 格式下出现
+            const isGif = outputFormat === 'gif';
+            const gifFrameField = document.getElementById('gifFrameField');
+            if(gifFrameField) gifFrameField.style.display = isGif ? '' : 'none';
+            const frameCountSel = document.getElementById('frameCountSelect');
+            if(frameCountSel) frameCountSel.value = String(frameCount);
+            const gifDurationField = document.getElementById('gifDurationField');
+            if(gifDurationField) gifDurationField.style.display = isGif ? '' : 'none';
+            const frameDurationSel = document.getElementById('frameDurationSelect');
+            if(frameDurationSel) frameDurationSel.value = String(frameDurationMs);
+            // 编辑保真只在带了参考图时才有意义；gpt-image-2 及以后官方已移除该字段，直接隐藏
             const hasRefs = Object.values(refs || {}).some(Boolean);
             const fidField = document.getElementById('fidelityField');
-            if(fidField) fidField.style.display = hasRefs ? '' : 'none';
+            if(fidField) fidField.style.display = (hasRefs && gptImageSupportsFidelity(selectedModel)) ? '' : 'none';
             const fidSel = document.getElementById('fidelitySelect');
             if(fidSel) fidSel.value = inputFidelity;
+            // SVG 输出要求只出一张
+            if(outputFormat === 'svg' && outputCount !== 1){
+                outputCount = 1;
+                const cs = document.getElementById('countSelect');
+                if(cs) cs.value = '1';
+            }
+            updateQualityOptions(newSeries);
+        }
+        // xhigh / max 质量档只有 2.5 / 2.6 系列支持，其它模型隐藏，避免无谓的 400
+        function updateQualityOptions(newSeries){
+            const show = !!newSeries;
+            document.querySelectorAll('#qualitySelect option.new-series-only').forEach(opt => {
+                opt.style.display = show ? '' : 'none';
+                if(!show && opt.selected){ opt.selected = false; }
+            });
+            const qs = document.getElementById('qualitySelect');
+            if(qs && !show && (qs.value === 'xhigh' || qs.value === 'max')){
+                quality = 'auto';
+                qs.value = 'auto';
+            }
         }
         function setBackground(next){
             outputBackground = next || '';
@@ -501,6 +596,15 @@
         }
         function setFidelity(next){
             inputFidelity = next || '';
+        }
+        function setComplexity(next){
+            outputComplexity = next || '';
+        }
+        function setFrameCount(next){
+            frameCount = Math.max(2, Math.min(16, parseInt(next, 10) || 9));
+        }
+        function setFrameDuration(next){
+            frameDurationMs = Math.max(20, parseInt(next, 10) || 200);
         }
 
         async function initModels(){
@@ -710,7 +814,7 @@
             updateOutputPanel();
         }
 
-        const OUTPUT_PARAM_LABELS = { input_fidelity:'编辑保真', output_format:'输出格式', output_compression:'压缩质量', background:'背景', quality:'质量', n:'数量' };
+        const OUTPUT_PARAM_LABELS = { input_fidelity:'编辑保真', output_format:'输出格式', output_compression:'压缩质量', background:'背景', quality:'质量', n:'数量', complexity:'复杂度', frame_count:'GIF 帧数', frame_duration_ms:'帧时长' };
         function ignoredNotice(list){
             const names = list.map(k => OUTPUT_PARAM_LABELS[k] || k).join('、');
             return `该平台把此模型映射到了能力更少的版本，上游不支持「${names}」，本次已自动忽略这项设置，其余参数照常生效。`;
@@ -761,7 +865,13 @@
                     if(outputFormat) reqBody.output_format = outputFormat;
                     if(outputBackground) reqBody.background = outputBackground;
                     if(outputFormat === 'jpeg' || outputFormat === 'webp') reqBody.output_compression = outputCompression;
-                    if(inputFidelity) reqBody.input_fidelity = inputFidelity;
+                    // gpt-image-2 及以后官方已移除 input_fidelity，不再发送
+                    if(inputFidelity && gptImageSupportsFidelity(selectedModel)) reqBody.input_fidelity = inputFidelity;
+                    if(outputComplexity && isGptImageNewSeries(selectedModel)) reqBody.complexity = outputComplexity;
+                    if(outputFormat === 'gif'){
+                        reqBody.frame_count = frameCount;
+                        reqBody.frame_duration_ms = frameDurationMs;
+                    }
                 }
                 const result = await fetch('/api/online-image', {
                     method:'POST', headers:{'Content-Type':'application/json'},

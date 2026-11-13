@@ -2837,6 +2837,11 @@ class OnlineImageRequest(BaseModel):
     output_compression: Optional[int] = None
     background: str = ""
     input_fidelity: str = ""
+    # gpt-image-2.5 / 2.6 新增：复杂度（渲染前的规划量，与 quality 独立）
+    complexity: str = ""
+    # gpt-image-2.6 新增：GIF 帧控制（仅 output_format=gif 时生效）
+    frame_count: Optional[int] = None
+    frame_duration_ms: Optional[int] = None
 
 class MidjourneySubmitRequest(BaseModel):
     provider_id: str = ""
@@ -9610,6 +9615,10 @@ def sniff_image_extension(raw):
         return ".gif"
     if head[:4] in (b"II*\x00", b"MM\x00*"):
         return ".tif"
+    # gpt-image-2.6 的 SVG 输出是文本，没有二进制魔数：按根标签判断
+    probe = raw[:512].lstrip()
+    if probe.startswith(b"<svg") or (probe.startswith(b"<?xml") and b"<svg" in raw[:4096]):
+        return ".svg"
     return ""
 
 async def save_ai_image_to_output(image_data, prefix="online_", category="output"):
@@ -9626,6 +9635,8 @@ async def save_ai_image_to_output(image_data, prefix="online_", category="output
                 ext = ".webp"
             elif "gif" in mime_type:
                 ext = ".gif"
+            elif "svg" in mime_type:
+                ext = ".svg"
             else:
                 ext = ".png"
         if ext != ".png":
@@ -9651,6 +9662,10 @@ async def save_ai_image_to_output(image_data, prefix="online_", category="output
                     ext = ".jpg"
                 elif "webp" in content_type:
                     ext = ".webp"
+                elif "gif" in content_type:
+                    ext = ".gif"
+                elif "svg" in content_type:
+                    ext = ".svg"
                 else:
                     ext = ".png"
             if ext != ".png":
@@ -9827,6 +9842,34 @@ def is_gpt_image_2_model(model):
         or compact.endswith("gptimage2")
     )
 
+
+# gpt-image-2.5 / 2.6 系列（sunburst、flare 等变体）。
+# 官方 edits 参考已把 gpt-image-2 标注为「必须省略 input_fidelity」，
+# 2.5/2.6 变体同样不接收该字段（实测中转会回 400），所以这一系列直接不发。
+def is_gpt_image_new_series(model):
+    raw = str(model or "").strip().lower()
+    normalized = re.sub(r"[^a-z0-9]+", "-", raw).strip("-")
+    compact = re.sub(r"[^a-z0-9]+", "", raw)
+    for tag in ("gpt-image-2-5", "gpt-image-2-6"):
+        if normalized.startswith(tag + "-") or ("-" + tag + "-") in normalized or normalized.endswith("-" + tag):
+            return True
+    for tag in ("gptimage25", "gptimage26"):
+        if compact.startswith(tag) or ("-" + tag + "-") in compact or compact.endswith("-" + tag):
+            return True
+    return False
+
+
+def gpt_image_supports_input_fidelity(model):
+    """input_fidelity 是否还能发给这个模型。
+
+    官方 /v1/images/edits 参考把 gpt-image-2 标注为「必须省略该参数」，
+    2.5 / 2.6 同样未提供该字段（实测中转会回 400：
+    "does not support the 'input_fidelity' parameter"）。
+    只有早期 gpt-image-1 / 1.5 / 1-mini 仍接受它。
+    """
+    compact = re.sub(r"[^a-z0-9]+", "", str(model or "").strip().lower())
+    return not compact.startswith("gptimage2")
+
 # 可以安全“删掉再试”的可选参数：它们只影响输出偏好，缺失时上游会走默认值。
 # 注意不包含 model / prompt / size / image 等必需字段。
 OPTIONAL_IMAGE_PARAMS = (
@@ -9836,6 +9879,9 @@ OPTIONAL_IMAGE_PARAMS = (
     "background",
     "quality",
     "n",
+    "complexity",
+    "frame_count",
+    "frame_duration_ms",
 )
 
 # 上游“不认识这个参数”的常见措辞，命中后从报错里提取参数名。
@@ -9977,29 +10023,48 @@ class RetryingImagePostClient:
         return getattr(self._client, name)
 
 
+# GPT Image 输出格式（官方 /v1/images 参考）
+GPT_IMAGE_OUTPUT_FORMATS = ("png", "jpeg", "webp", "gif", "svg")
+# transparent 背景只允许搭配 png / webp（官方明确要求）
+GPT_IMAGE_TRANSPARENT_FORMATS = ("png", "webp")
+# complexity：渲染前的规划量，与 quality 相互独立
+GPT_IMAGE_COMPLEXITY_LEVELS = ("low", "medium", "high")
+# GIF 帧控制：官方 frame_count 取值 2~16，frame_duration_ms 最小 20
+GPT_IMAGE_GIF_FRAME_COUNT_MIN = 2
+GPT_IMAGE_GIF_FRAME_COUNT_MAX = 16
+GPT_IMAGE_GIF_FRAME_DURATION_MIN = 20
+
+
 def gpt_image_output_options(model, output_format="", output_compression=None,
-                             background="", input_fidelity=""):
-    """组装 gpt-image-2 的输出控制参数。
+                             background="", input_fidelity="", complexity="",
+                             frame_count=None, frame_duration_ms=None):
+    """组装 gpt-image 系的输出控制参数。
 
     只有 gpt-image 系模型支持这些字段，其它模型一律返回空字典，
     避免把不认识的参数发给上游导致 400。
 
-    注意：gpt-image-2.5 系列各变体支持的字段并不一致（例如 gpt-image-2.5-flare
-    明确拒绝 input_fidelity）。这里不做硬编码的能力猜测，而是在发送阶段按上游
-    报错精确剔除（见 send_with_optional_param_retry），并把结果缓存下来。
+    注意：gpt-image-2.5 / 2.6 系列各变体支持的字段并不一致（例如 2.5-flare
+    明确拒绝 input_fidelity）。这里不做大规模硬编码的能力猜测，规则只依据官方文档：
+      * input_fidelity —— 官方 edits 参考把 gpt-image-2 标注为「必须省略」，
+        2.5/2.6 变体同样不接收，因此这一系列直接不发；
+      * complexity —— 2.5/2.6 起新增，早期模型不发，避免无谓的 400 往返；
+      * gif / svg 输出 —— 2.6 起支持。
+    其余不确定的情况，仍在发送阶段按上游报错精确剔除（见
+    send_with_optional_param_retry），并把结果缓存下来。
     """
     if not is_gpt_image_2_model(model):
         return {}
     opts = {}
     fmt = str(output_format or "").strip().lower()
     bg = str(background or "").strip().lower()
-    if fmt not in {"png", "jpeg", "webp"}:
+    if fmt not in GPT_IMAGE_OUTPUT_FORMATS:
         fmt = ""
-    # 透明背景只支持 png / webp，选了 jpeg 时自动纠正为 png
-    if fmt == "jpeg" and bg == "transparent":
+    # 透明背景只支持 png / webp：选了其它格式时自动纠正为 png
+    if bg == "transparent" and fmt and fmt not in GPT_IMAGE_TRANSPARENT_FORMATS:
         fmt = "png"
     if fmt:
         opts["output_format"] = fmt
+        # output_compression 仅 jpeg / webp 生效；svg / gif 不接受该字段
         if fmt in {"jpeg", "webp"} and output_compression is not None:
             try:
                 level = int(output_compression)
@@ -10010,8 +10075,27 @@ def gpt_image_output_options(model, output_format="", output_compression=None,
     if bg in {"auto", "transparent", "opaque"}:
         opts["background"] = bg
     fidelity = str(input_fidelity or "").strip().lower()
-    if fidelity in {"low", "high"}:
+    # 官方已移除该字段的模型（gpt-image-2 / 2.5 / 2.6）不发，硬发必然 400
+    if fidelity in {"low", "high"} and gpt_image_supports_input_fidelity(model):
         opts["input_fidelity"] = fidelity
+    # complexity：只对 2.5 / 2.6 系列发送
+    level = str(complexity or "").strip().lower()
+    if level in GPT_IMAGE_COMPLEXITY_LEVELS and is_gpt_image_new_series(model):
+        opts["complexity"] = level
+    # GIF 帧控制：仅 output_format=gif 时有意义
+    if fmt == "gif":
+        try:
+            count = int(frame_count) if frame_count is not None else None
+        except (TypeError, ValueError):
+            count = None
+        if count is not None:
+            opts["frame_count"] = max(GPT_IMAGE_GIF_FRAME_COUNT_MIN, min(GPT_IMAGE_GIF_FRAME_COUNT_MAX, count))
+        try:
+            duration = int(frame_duration_ms) if frame_duration_ms is not None else None
+        except (TypeError, ValueError):
+            duration = None
+        if duration is not None:
+            opts["frame_duration_ms"] = max(GPT_IMAGE_GIF_FRAME_DURATION_MIN, duration)
     return opts
 
 def normalize_gpt_image_2_size(size):
@@ -11679,7 +11763,8 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
     # 不对 GPT 尺寸做任何缩小/拦截：用户选什么尺寸就原样发给上游；
     # 若超过 GPT 的最大像素限制被上游拒绝，再由 friendly_image_error_detail 给出友好的像素上限提示。
     quality = str(quality or "").strip().lower()
-    if quality not in {"low", "medium", "high"}:
+    # xhigh / max 是 gpt-image-2.5 / 2.6 新增的质量档；上游不认时由降级机制剔除
+    if quality not in {"low", "medium", "high", "xhigh", "max"}:
         quality = ""
     base_url = (provider.get("base_url") or AI_BASE_URL).rstrip("/")
     if not base_url:
@@ -14531,7 +14616,11 @@ async def build_online_image_result(payload: OnlineImageRequest):
     output_options = gpt_image_output_options(
         model, payload.output_format, payload.output_compression,
         payload.background, payload.input_fidelity,
+        payload.complexity, payload.frame_count, payload.frame_duration_ms,
     )
+    # SVG 输出要求 n=1，否则上游直接拒绝
+    if output_options.get("output_format") == "svg":
+        count = 1
     if operation == "upscale":
         if not is_jimeng_provider(provider):
             raise HTTPException(status_code=400, detail="图片放大目前仅支持即梦（Dreamina）平台")
