@@ -261,6 +261,25 @@ def _storage_abs_path(value, fallback):
         text = os.path.join(BASE_DIR, text)
     return os.path.abspath(text)
 
+def ensure_dir(path):
+    """尽力创建目录，失败只告警不抛异常，返回目录是否可用。"""
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError as exc:
+        print(f"[storage] 目录不可用，已跳过: {path} ({exc})")
+        return False
+    return os.path.isdir(path)
+
+def _storage_config_value(path):
+    """项目目录内的路径保存为相对路径，保证配置文件可跨机器/跨盘符复用。"""
+    try:
+        rel = os.path.relpath(os.path.abspath(path), BASE_DIR)
+    except (ValueError, OSError):
+        return os.path.abspath(path)
+    if rel.startswith(".."):
+        return os.path.abspath(path)
+    return rel.replace("\\", "/")
+
 def load_storage_settings():
     raw = {}
     try:
@@ -272,7 +291,14 @@ def load_storage_settings():
         raw = {}
     dirs = {}
     for key, fallback in DEFAULT_STORAGE_DIRS.items():
-        dirs[key] = _storage_abs_path((raw or {}).get(key), fallback)
+        fallback_abs = os.path.abspath(fallback)
+        configured = _storage_abs_path((raw or {}).get(key), fallback)
+        # 配置可能来自其它机器或其它盘符（例如 F:\...）。本机不可用时回退到默认目录，
+        # 避免启动阶段因为一个不存在的盘符直接中断。
+        if os.path.normcase(configured) != os.path.normcase(fallback_abs) and not ensure_dir(configured):
+            print(f"[storage] {key} 目录不可用，回退到默认目录: {fallback_abs}")
+            configured = fallback_abs
+        dirs[key] = configured
     return {"dirs": dirs}
 
 def save_storage_settings(payload):
@@ -280,10 +306,12 @@ def save_storage_settings(payload):
     for key, fallback in DEFAULT_STORAGE_DIRS.items():
         dirs[key] = _storage_abs_path((payload or {}).get(key), fallback)
     for path in dirs.values():
-        os.makedirs(path, exist_ok=True)
+        if not ensure_dir(path):
+            raise HTTPException(status_code=400, detail=f"目录无法创建，请检查路径是否正确: {path}")
     os.makedirs(DATA_DIR, exist_ok=True)
+    portable = {key: _storage_config_value(path) for key, path in dirs.items()}
     with open(STORAGE_SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(dirs, f, ensure_ascii=False, indent=2)
+        json.dump(portable, f, ensure_ascii=False, indent=2)
     apply_storage_settings(dirs)
     return {"dirs": dirs}
 
@@ -602,6 +630,13 @@ APIMART_IMAGE_INITIAL_POLL_DELAY = float(os.getenv("APIMART_IMAGE_INITIAL_POLL_D
 TUDOU_ASYNC_IMAGE_TASK_TIMEOUT = float(os.getenv("TUDOU_ASYNC_IMAGE_TASK_TIMEOUT", "1800"))
 TUDOU_ASYNC_IMAGE_POLL_INTERVAL = float(os.getenv("TUDOU_ASYNC_IMAGE_POLL_INTERVAL", "4"))
 TUDOU_ASYNC_IMAGE_INITIAL_POLL_DELAY = float(os.getenv("TUDOU_ASYNC_IMAGE_INITIAL_POLL_DELAY", "12"))
+# 轮询返回既没有状态字段也没有图片时，连续多少次判定为“查询地址不对”，
+# 换下一个候选地址；候选都试完就立即报错，而不是静默等到 30 分钟超时。
+IMAGE_TASK_UNRECOGNIZED_LIMIT = int(os.getenv("IMAGE_TASK_UNRECOGNIZED_LIMIT", "4"))
+# 上游返回大 JSON（base64 图片常有 2~4MB）时，中转/代理常在传输中途掐断连接。
+# 这种失败是“图已生成、没传回来”，同一请求重发一次通常就能拿到。
+# 代价是可能重复计费，所以只重试一次，且可用 IMAGE_TRANSPORT_RETRY=0 关掉。
+IMAGE_TRANSPORT_RETRY = str(os.getenv("IMAGE_TRANSPORT_RETRY", "1")).strip().lower() not in {"0", "false", "no", "off"}
 VIDEO_POLL_TIMEOUT = float(os.getenv("VIDEO_POLL_TIMEOUT", "1800"))
 ONLINE_IMAGE_PROMPT_MAX_LENGTH = int(os.getenv("ONLINE_IMAGE_PROMPT_MAX_LENGTH", "20000"))
 VIDEO_PROMPT_MAX_LENGTH = int(os.getenv("VIDEO_PROMPT_MAX_LENGTH", "4000"))
@@ -1547,16 +1582,10 @@ def update_env_values(updates):
 
 BACKEND_LOCAL_LOAD = {addr: 0 for addr in COMFYUI_INSTANCES}
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-os.makedirs(ASSETS_DIR, exist_ok=True)
-os.makedirs(OUTPUT_INPUT_DIR, exist_ok=True)
-os.makedirs(OUTPUT_OUTPUT_DIR, exist_ok=True)
-os.makedirs(ASSET_LIBRARY_DIR, exist_ok=True)
-os.makedirs(LOCAL_UPLOAD_DIR, exist_ok=True)
-os.makedirs(STATIC_DIR, exist_ok=True)
-os.makedirs(WORKFLOW_DIR, exist_ok=True)
-os.makedirs(CONVERSATION_DIR, exist_ok=True)
-os.makedirs(CANVAS_DIR, exist_ok=True)
+for _required_dir in (OUTPUT_DIR, ASSETS_DIR, OUTPUT_INPUT_DIR, OUTPUT_OUTPUT_DIR,
+                      ASSET_LIBRARY_DIR, LOCAL_UPLOAD_DIR, STATIC_DIR,
+                      WORKFLOW_DIR, CONVERSATION_DIR, CANVAS_DIR):
+    ensure_dir(_required_dir)
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 app.mount("/output", StaticFiles(directory=OUTPUT_DIR), name="output")
@@ -2803,6 +2832,11 @@ class OnlineImageRequest(BaseModel):
     reference_images: List[AIReference] = []
     operation: str = ""
     resolution_type: str = ""
+    # gpt-image-2 输出控制（仅 gpt-image 系模型生效，其它模型自动忽略）
+    output_format: str = ""
+    output_compression: Optional[int] = None
+    background: str = ""
+    input_fidelity: str = ""
 
 class MidjourneySubmitRequest(BaseModel):
     provider_id: str = ""
@@ -6833,6 +6867,21 @@ def image_task_url_for_provider(provider, task_id):
         return f"{base_url}/tasks/{task_id}" if base_url.endswith("/v1") else f"{base_url}/v1/tasks/{task_id}"
     return f"{base_url}/images/tasks/{task_id}" if base_url.endswith("/v1") else f"{base_url}/v1/images/tasks/{task_id}"
 
+def image_task_url_candidates(provider, task_id):
+    """返回可尝试的任务查询地址（首个是按配置推断的，后面是兼容候选）。
+
+    部分中转平台的协议标记与实际任务接口不一致（例如标记 openai，任务却挂在
+    /v1/tasks/{id}）。轮询是幂等 GET，多试一个地址的成本远低于静默等到超时。
+    """
+    base_url = (provider.get("base_url") if provider else AI_BASE_URL).rstrip("/")
+    primary = image_task_url_for_provider(provider, task_id)
+    candidates = [primary]
+    for path in (f"/images/tasks/{task_id}", f"/tasks/{task_id}"):
+        url = f"{base_url}{path}" if base_url.endswith("/v1") else f"{base_url}/v1{path}"
+        if url not in candidates:
+            candidates.append(url)
+    return candidates
+
 def image_task_data(payload):
     if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
         return payload["data"]
@@ -6868,8 +6917,8 @@ async def httpx_request_with_transient_retries(client, method, url, attempts=2, 
         raise last_exc
     raise httpx.HTTPError(f"请求失败：{method} {url}")
 
-async def fetch_image_task_payload(client, task_id, provider=None):
-    task_url = image_task_url_for_provider(provider, task_id)
+async def fetch_image_task_payload(client, task_id, provider=None, task_url=None):
+    task_url = task_url or image_task_url_for_provider(provider, task_id)
     response = await httpx_request_with_transient_retries(
         client,
         "GET",
@@ -6880,6 +6929,14 @@ async def fetch_image_task_payload(client, task_id, provider=None):
     response.raise_for_status()
     return response.json()
 
+def image_task_payload_hint(payload):
+    """把轮询响应压成一行，便于在报错信息里直接看出上游到底回了什么。"""
+    try:
+        text = json.dumps(payload, ensure_ascii=False)
+    except Exception:
+        text = str(payload)
+    return text[:300] or "（空响应）"
+
 async def wait_for_image_task(client, task_id, provider=None):
     is_apimart = is_apimart_provider(provider)
     is_tudou_async = is_tudou_async_image_mode(provider)
@@ -6887,14 +6944,42 @@ async def wait_for_image_task(client, task_id, provider=None):
     interval = TUDOU_ASYNC_IMAGE_POLL_INTERVAL if is_tudou_async else APIMART_IMAGE_POLL_INTERVAL if is_apimart else IMAGE_POLL_INTERVAL
     initial_delay = TUDOU_ASYNC_IMAGE_INITIAL_POLL_DELAY if is_tudou_async else APIMART_IMAGE_INITIAL_POLL_DELAY if is_apimart else 0
     deadline = time.monotonic() + timeout
+    candidates = image_task_url_candidates(provider, task_id)
+    cand_idx = 0
+    unrecognized = 0
     last_payload = {}
+    last_url = candidates[0]
+    tried = [last_url]
     while time.monotonic() < deadline:
         if initial_delay:
             await asyncio.sleep(min(initial_delay, max(0.0, deadline - time.monotonic())))
             initial_delay = 0
             if time.monotonic() >= deadline:
                 break
-        last_payload = await fetch_image_task_payload(client, task_id, provider)
+        last_url = candidates[cand_idx]
+        try:
+            last_payload = await fetch_image_task_payload(client, task_id, provider, last_url)
+        except httpx.HTTPStatusError as exc:
+            code = exc.response.status_code
+            # 404/405/400 通常表示这个平台的任务不在这个地址上，换下一个候选地址
+            if code in {400, 404, 405} and cand_idx + 1 < len(candidates):
+                cand_idx += 1
+                unrecognized = 0
+                tried.append(candidates[cand_idx])
+                print(f"[image-task] 查询地址 {last_url} 返回 {code}，改试 {candidates[cand_idx]}（task_id={task_id}）", flush=True)
+                continue
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"查询生图任务失败：{last_url} 返回 HTTP {code}，task_id={task_id}。"
+                    f"已尝试地址：{'、'.join(tried)}。请到「API 设置」核对该平台的「图片接口」是否与实际任务接口匹配。"
+                ),
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"查询生图任务失败：{last_url} {exc}，task_id={task_id}",
+            ) from exc
         status = image_task_status(last_payload)
         if not status:
             try:
@@ -6902,6 +6987,33 @@ async def wait_for_image_task(client, task_id, provider=None):
                     return last_payload
             except HTTPException:
                 pass
+            # 响应里既没有状态字段也没有图片：说明这个地址不是任务查询接口
+            # （很多中转会用 200 包一层错误体，光看状态码发现不了）。
+            # 以前这里会静默轮询到 30 分钟超时，日志一个字都不打。
+            unrecognized += 1
+            if unrecognized >= IMAGE_TASK_UNRECOGNIZED_LIMIT:
+                if cand_idx + 1 < len(candidates):
+                    cand_idx += 1
+                    unrecognized = 0
+                    tried.append(candidates[cand_idx])
+                    print(
+                        f"[image-task] {last_url} 连续 {IMAGE_TASK_UNRECOGNIZED_LIMIT} 次返回无法识别的响应，"
+                        f"改试 {candidates[cand_idx]}（task_id={task_id}）",
+                        flush=True,
+                    )
+                    continue
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        f"上游任务 {task_id} 查不到结果：已尝试地址 {'、'.join(tried)}，"
+                        f"返回内容里既没有状态字段也没有图片（最后响应：{image_task_payload_hint(last_payload)}）。"
+                        "这通常是该平台的任务查询地址与「图片接口」设置不匹配："
+                        "如果平台是异步任务式，请在「API 设置」把图片接口改为「异步协议 / OpenAI 中转 / 土豆异步」中匹配的一项。"
+                    ),
+                )
+            await asyncio.sleep(min(interval, max(0.0, deadline - time.monotonic())))
+            continue
+        unrecognized = 0
         if status in IMAGE_TASK_SUCCESS_STATUSES:
             return last_payload
         if status in IMAGE_TASK_FAILED_STATUSES:
@@ -6909,7 +7021,7 @@ async def wait_for_image_task(client, task_id, provider=None):
         await asyncio.sleep(min(interval, max(0.0, deadline - time.monotonic())))
     raw_text = json.dumps(last_payload, ensure_ascii=False)[:800] if last_payload else ""
     extra = f"，最后响应：{raw_text}" if raw_text else ""
-    raise HTTPException(status_code=504, detail=f"生图任务超时（已等待 {int(timeout)} 秒），task_id={task_id}{extra}")
+    raise HTTPException(status_code=504, detail=f"生图任务超时（已等待 {int(timeout)} 秒），task_id={task_id}，查询地址 {last_url}{extra}")
 
 def output_storage(category="output"):
     return (OUTPUT_INPUT_DIR, "input") if category == "input" else (OUTPUT_OUTPUT_DIR, "output")
@@ -9479,19 +9591,48 @@ async def upload_local_video_to_cloud(ref_url: str, service: str = "auto") -> Di
 async def upload_local_video_to_temp_sh(ref_url: str) -> Dict[str, str]:
     return await upload_local_video_to_cloud(ref_url, "auto")
 
+def sniff_image_extension(raw):
+    """按文件头判断真实图片格式。
+
+    上游返回 b64 时通常不带 mime，解析层会默认成 image/png；
+    一旦用户选了 output_format=webp/jpeg，按默认值落盘就会得到后缀与内容不符的文件。
+    """
+    if not raw:
+        return ""
+    head = raw[:16]
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if head.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return ".webp"
+    if head[:6] in (b"GIF87a", b"GIF89a"):
+        return ".gif"
+    if head[:4] in (b"II*\x00", b"MM\x00*"):
+        return ".tif"
+    return ""
+
 async def save_ai_image_to_output(image_data, prefix="online_", category="output"):
     filename = f"{prefix}{uuid.uuid4().hex[:10]}.png"
     path = output_path_for(filename, category)
     if image_data["type"] == "b64":
-        mime_type = str(image_data.get("mime_type") or "").lower()
-        if "jpeg" in mime_type or "jpg" in mime_type:
-            filename = filename[:-4] + ".jpg"
-            path = output_path_for(filename, category)
-        elif "webp" in mime_type:
-            filename = filename[:-4] + ".webp"
+        raw = base64.b64decode(image_data["value"])
+        ext = sniff_image_extension(raw)
+        if not ext:
+            mime_type = str(image_data.get("mime_type") or "").lower()
+            if "jpeg" in mime_type or "jpg" in mime_type:
+                ext = ".jpg"
+            elif "webp" in mime_type:
+                ext = ".webp"
+            elif "gif" in mime_type:
+                ext = ".gif"
+            else:
+                ext = ".png"
+        if ext != ".png":
+            filename = filename[:-4] + ext
             path = output_path_for(filename, category)
         with open(path, "wb") as f:
-            f.write(base64.b64decode(image_data["value"]))
+            f.write(raw)
         return output_url_for(filename, category)
     value = image_data["value"]
     if value.startswith("/output/") or value.startswith("/assets/"):
@@ -9502,15 +9643,21 @@ async def save_ai_image_to_output(image_data, prefix="online_", category="output
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             response = await client.get(value)
             response.raise_for_status()
-            content_type = response.headers.get("Content-Type", "")
-            if "jpeg" in content_type or "jpg" in content_type:
-                filename = filename[:-4] + ".jpg"
-                path = output_path_for(filename, category)
-            elif "webp" in content_type:
-                filename = filename[:-4] + ".webp"
+            content = response.content
+            ext = sniff_image_extension(content)
+            if not ext:
+                content_type = response.headers.get("Content-Type", "")
+                if "jpeg" in content_type or "jpg" in content_type:
+                    ext = ".jpg"
+                elif "webp" in content_type:
+                    ext = ".webp"
+                else:
+                    ext = ".png"
+            if ext != ".png":
+                filename = filename[:-4] + ext
                 path = output_path_for(filename, category)
             with open(path, "wb") as f:
-                f.write(response.content)
+                f.write(content)
             return output_url_for(filename, category)
     except Exception as e:
         print(f"保存上游图片失败: {e}; url={value}")
@@ -9680,6 +9827,193 @@ def is_gpt_image_2_model(model):
         or compact.endswith("gptimage2")
     )
 
+# 可以安全“删掉再试”的可选参数：它们只影响输出偏好，缺失时上游会走默认值。
+# 注意不包含 model / prompt / size / image 等必需字段。
+OPTIONAL_IMAGE_PARAMS = (
+    "input_fidelity",
+    "output_compression",
+    "output_format",
+    "background",
+    "quality",
+    "n",
+)
+
+# 上游“不认识这个参数”的常见措辞，命中后从报错里提取参数名。
+_UNSUPPORTED_PARAM_PATTERNS = (
+    re.compile(r"does not support the ['\"`]?([a-z0-9_]+)['\"`]? parameter", re.I),
+    re.compile(r"does not support (?:the )?parameter ['\"`]?([a-z0-9_]+)['\"`]?", re.I),
+    re.compile(r"(?:unsupported|unknown|unrecognized)\s+parameter[s]?[:\s]*['\"`]?([a-z0-9_]+)['\"`]?", re.I),
+    re.compile(r"['\"`]([a-z0-9_]+)['\"`]\s*(?:is\s*)?not supported", re.I),
+    re.compile(r"参数\s*['\"`]?([a-z0-9_]+)['\"`]?\s*(?:不受支持|不支持)", re.I),
+)
+
+# 记录「某平台某模型明确拒绝过哪些可选参数」，避免每次生成都先撞一次 400。
+# 键为 (provider_id, model)，只在进程内有效；映射关系变化时重启即可清空。
+IMAGE_PARAM_REJECT_CACHE = {}
+
+
+def unsupported_request_params(text, candidates=OPTIONAL_IMAGE_PARAMS):
+    """从上游 400 报文里解析出“不支持”的参数名，只返回调用方允许剔除的字段。"""
+    allowed = {str(name).lower() for name in (candidates or ())}
+    found = []
+    for pattern in _UNSUPPORTED_PARAM_PATTERNS:
+        for name in pattern.findall(str(text or "")):
+            key = str(name).strip().lower()
+            if key in allowed and key not in found:
+                found.append(key)
+    return found
+
+
+def known_rejected_params(provider_id, model):
+    key = (str(provider_id or ""), str(model or "").strip().lower())
+    return set(IMAGE_PARAM_REJECT_CACHE.get(key) or ())
+
+
+def remember_rejected_params(provider_id, model, dropped):
+    if not dropped:
+        return
+    key = (str(provider_id or ""), str(model or "").strip().lower())
+    IMAGE_PARAM_REJECT_CACHE.setdefault(key, set()).update(dropped)
+
+
+def note_ignored_params(notes, dropped):
+    """把被上游忽略的参数记进本次结果的 notes，供前端/历史展示。"""
+    if notes is None or not dropped:
+        return
+    for key in dropped:
+        if key not in notes:
+            notes.append(key)
+
+
+async def send_with_optional_param_retry(send, params, candidates=OPTIONAL_IMAGE_PARAMS,
+                                         provider_id="", model="", label="", max_rounds=3):
+    """发送生图请求；上游报“不支持某参数”时剔除该参数后重试。
+
+    为什么需要：平台常在上游做模型映射（例如别名 gpt-image-2 实际路由到
+    gpt-image-2.5-flare），映射后的模型支持的可选参数可能比别名少，而调用方
+    无从预知映射目标，硬发就会 400。这里只在报错**明确点名**某参数时才降级，
+    不做“任意 400 就盲重试”，以免内容安全拦截等场景被无意义地重复请求。
+
+    参数不支持属于请求被拒、未产生生成与扣费，因此重试是安全的。
+
+    返回 (response, dropped, applied)，applied 为实际生效的参数。
+    """
+    current = dict(params or {})
+    dropped = []
+    response = await send(current)
+    rounds = 0
+    while getattr(response, "status_code", 0) == 400 and rounds < max_rounds:
+        bad = unsupported_request_params(getattr(response, "text", ""), candidates)
+        if not bad:
+            break
+        for key in bad:
+            current.pop(key, None)
+            if key not in dropped:
+                dropped.append(key)
+        rounds += 1
+        print(f"[image] {label or model} 上游不支持参数 {bad}，已剔除后重试（第 {rounds} 次）")
+        response = await send(current)
+    if dropped:
+        remember_rejected_params(provider_id, model, dropped)
+    return response, dropped, current
+
+
+def is_truncated_response(exc):
+    """判断异常是不是“响应体传到一半被掐断”，而不是连不上或超时。"""
+    text = str(exc or "").lower()
+    return (
+        "peer closed connection" in text
+        or "incomplete" in text
+        or "connection reset" in text
+        or "server disconnected" in text
+    )
+
+
+def transport_error_detail(exc, url=""):
+    """把传输层异常翻译成用户能照着做的提示。不是传输问题就返回空串。"""
+    text = str(exc or "")
+    match = re.search(r"received (\d+) bytes, expected (\d+)", text, re.I)
+    retried = "已自动重试一次；" if IMAGE_TRANSPORT_RETRY else ""
+    if match:
+        got, want = int(match.group(1)), int(match.group(2))
+        pct = (got / want * 100.0) if want else 0.0
+        return (
+            f"上游把图片数据传到一半就断开了：只收到 {got:,} / {want:,} 字节（{pct:.1f}%）。"
+            "图片其实已经生成，失败发生在回传阶段——常见于中转带宽不稳、代理/VPN 掐断大响应、"
+            f"或服务端写超时。{retried}如果仍然失败：① 关掉代理/VPN 再试；"
+            "② 把尺寸降到 1024x1024 减小响应体积；③ 换一个平台，或把「图片接口」改成返回 URL 的模式。"
+        )
+    if is_truncated_response(exc):
+        return f"上游连接中途断开，响应没有传完。{retried}仍失败请检查代理/VPN，或换平台重试。"
+    return ""
+
+
+class RetryingImagePostClient:
+    """给生图 POST 加一次“传输中断”重试。
+
+    只对不带文件的 JSON POST 生效：
+    - 大 JSON（base64 图片常有 2~4MB）被中途掐断时，同一请求重发通常就能拿到；
+    - multipart 请求不能这样重试——文件句柄第一次已读到末尾，重发会发出 0 字节文件
+      （这类请求在 _send_edit 里已按次重新打开文件，走自己的重试路径）。
+    其余方法（get / request / stream）全部透传给真实 client。
+    """
+
+    def __init__(self, client):
+        self._client = client
+        self.retried = False
+
+    async def post(self, *args, **kwargs):
+        try:
+            return await self._client.post(*args, **kwargs)
+        except (httpx.RemoteProtocolError, httpx.ReadError) as exc:
+            if self.retried or not IMAGE_TRANSPORT_RETRY or kwargs.get("files") or not is_truncated_response(exc):
+                raise
+            self.retried = True
+            url = args[0] if args else kwargs.get("url", "")
+            print(f"[image] 传输中断，同一请求重试一次（可能重复计费）：{url} | {exc}", flush=True)
+            return await self._client.post(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._client, name)
+
+
+def gpt_image_output_options(model, output_format="", output_compression=None,
+                             background="", input_fidelity=""):
+    """组装 gpt-image-2 的输出控制参数。
+
+    只有 gpt-image 系模型支持这些字段，其它模型一律返回空字典，
+    避免把不认识的参数发给上游导致 400。
+
+    注意：gpt-image-2.5 系列各变体支持的字段并不一致（例如 gpt-image-2.5-flare
+    明确拒绝 input_fidelity）。这里不做硬编码的能力猜测，而是在发送阶段按上游
+    报错精确剔除（见 send_with_optional_param_retry），并把结果缓存下来。
+    """
+    if not is_gpt_image_2_model(model):
+        return {}
+    opts = {}
+    fmt = str(output_format or "").strip().lower()
+    bg = str(background or "").strip().lower()
+    if fmt not in {"png", "jpeg", "webp"}:
+        fmt = ""
+    # 透明背景只支持 png / webp，选了 jpeg 时自动纠正为 png
+    if fmt == "jpeg" and bg == "transparent":
+        fmt = "png"
+    if fmt:
+        opts["output_format"] = fmt
+        if fmt in {"jpeg", "webp"} and output_compression is not None:
+            try:
+                level = int(output_compression)
+            except (TypeError, ValueError):
+                level = None
+            if level is not None:
+                opts["output_compression"] = max(0, min(level, 100))
+    if bg in {"auto", "transparent", "opaque"}:
+        opts["background"] = bg
+    fidelity = str(input_fidelity or "").strip().lower()
+    if fidelity in {"low", "high"}:
+        opts["input_fidelity"] = fidelity
+    return opts
+
 def normalize_gpt_image_2_size(size):
     width, height = parse_size_pair(size)
     if not width or not height:
@@ -9804,6 +10138,16 @@ def normalize_volcengine_size(size, model=""):
 def friendly_image_error_detail(text, size="", model=""):
     text = str(text or "")
     lower_text = text.lower()
+    # 上游明确点名“不支持某参数”：多为平台做了模型映射（别名 → 能力更少的实际模型）。
+    # 调用侧已自动剔除重试，走到这里说明去掉参数后仍未成功。
+    unsupported = unsupported_request_params(text, OPTIONAL_IMAGE_PARAMS)
+    if unsupported:
+        names = "、".join(unsupported)
+        return (
+            f"上游模型不支持参数「{names}」：该平台很可能把模型映射到了能力更少的版本。"
+            f"系统已自动去掉该参数重试，但本次仍未成功，请关闭对应的输出选项（透明背景 / 输出格式 / 编辑保真）后再生成。"
+            f"原始报错：{text[:160]}"
+        )
     if is_gpt_image_2_model(model) and gpt_image_2_size_exceeds_supported(size):
         return gpt_image_2_size_error_message(size)
     mentions_size = any(token in lower_text for token in ["size", "resolution", "dimension"])
@@ -9829,6 +10173,14 @@ def friendly_image_error_detail(text, size="", model=""):
         return gpt_image_2_size_error_message(size)
     if "invalid size" in lower_text or "invalid_value" in lower_text:
         return f"该模型不支持当前尺寸：{size or '未指定'}。请尝试更换分辨率或模型。"
+    if any(token in text for token in ("裸露", "色情", "情色", "防护限制", "安全策略", "内容审核", "敏感内容")) or any(
+        token in lower_text for token in ("safety_violation", "moderation_blocked", "sensitive_content", "sexual")
+    ):
+        return (
+            "上游内容安全拦截了本次生成：提示词或参考图触发了上游的成人/敏感内容策略，这不是本系统故障，"
+            "原样重试大概率仍会被拦。建议：① 改写描述，避免裸露、亲密动作等直接表述，改用服装、姿态、光线的间接描述；"
+            "② 若用了人物参考图，换一张更保守的图；③ 换一个平台或模型再试。"
+        )
     if "inputtextsensitivecontentdetected" in lower_text or "policyviolation" in lower_text or "copyright restrictions" in lower_text:
         return "上游内容安全拦截了这段提示词，原因偏向版权/敏感内容限制。请改写提示词，避免直接出现具体 IP、角色名、品牌名、影视/动漫作品名，改成风格特征描述再试。"
     if "rejected by the safety system" in lower_text or "image_generation_user_error" in lower_text or "safety system" in lower_text or "content_policy_violation" in lower_text or "content policy" in lower_text:
@@ -9996,12 +10348,40 @@ def gemini_candidate_text(raw):
                 parts.append(part["text"])
     return "\n".join(parts).strip()
 
+def gemini_candidate_parts(raw):
+    """取出候选回复的 parts（保留 thoughtSignature），供多轮续聊原样回传。
+
+    Gemini 3 系在连续对话中要求回传上一轮的思考签名，只回传纯文本会丢失签名，
+    可能导致下一轮直接 400 或质量明显下降。
+    """
+    if not isinstance(raw, dict):
+        return []
+    candidates = raw.get("candidates")
+    if not isinstance(candidates, list) or not candidates:
+        return []
+    first = candidates[0] if isinstance(candidates[0], dict) else None
+    content = first.get("content") if isinstance(first, dict) else None
+    parts = content.get("parts") if isinstance(content, dict) else None
+    if not isinstance(parts, list):
+        return []
+    kept = []
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        # 图片类 part 不回传：体积大，且此时说明已经有图了，不会走到这里
+        if any(part.get(key) for key in ("inlineData", "inline_data", "fileData", "file_data")):
+            continue
+        kept.append(part)
+    return kept
+
 async def generate_gemini_provider_image(prompt, size, model, reference_images=None, provider=None):
     model_name = gemini_model_name(model)
     endpoint = gemini_endpoint_url(provider, model_name)
     user_parts = [{"text": prompt.strip()}]
     reference_uris = set()
-    for ref in (reference_images or [])[:ONLINE_IMAGE_REFERENCE_MAX]:
+    # Gemini 3 Pro Image 单次提示最多 14 张参考图，超出会被上游拒绝
+    ref_limit = 14 if "gemini-3" in str(model_name).lower() else ONLINE_IMAGE_REFERENCE_MAX
+    for ref in (reference_images or [])[:ref_limit]:
         part = gemini_reference_part(ref)
         if part:
             user_parts.append(part)
@@ -10044,10 +10424,12 @@ async def generate_gemini_provider_image(prompt, size, model, reference_images=N
         if _round >= max_rounds - 1:
             break
         # Gemini 2.5 系中转第一轮可能只返回思考 part（thoughtSignature）且丢掉文本，
-        # 此时不能直接放弃：回填占位文本后继续追一轮，明确要求直接出图。
-        model_text = gemini_candidate_text(last_raw) or "（上一轮未返回图片，请直接输出图片。）"
-        # 把本轮模型文本回填进对话，并明确要求直接出图
-        contents.append({"role": "model", "parts": [{"text": model_text}]})
+        # 此时不能直接放弃：回填上一轮 parts（含签名）后继续追一轮，明确要求直接出图。
+        model_parts = gemini_candidate_parts(last_raw)
+        if not model_parts:
+            model_parts = [{"text": gemini_candidate_text(last_raw) or "（上一轮未返回图片，请直接输出图片。）"}]
+        # 把本轮模型回复原样回填进对话（保留 thoughtSignature），并明确要求直接出图
+        contents.append({"role": "model", "parts": model_parts})
         contents.append({"role": "user", "parts": [{"text": "请直接输出图片，不要返回任何文字。"}]})
     _log_unparsed_image_response(last_raw, "gemini")
     raise HTTPException(status_code=502, detail="gemini 生图接口仅返回文本、多次对话后仍未返回图片数据")
@@ -11262,8 +11644,16 @@ async def generate_runninghub_video(payload, provider):
         local_urls = [await save_remote_video_to_output(url, prefix="rh_video_") for url in urls]
         return {"videos": local_urls, "task_id": task_id, "raw": result}
 
-async def generate_ai_image(prompt, size, quality, model, reference_images=None, provider_id="comfly", aspect_ratio="", resolution=""):
+async def generate_ai_image(prompt, size, quality, model, reference_images=None, provider_id="comfly", aspect_ratio="", resolution="", output_options=None, notes=None):
     provider = get_api_provider(provider_id)
+    # 该平台/模型此前明确拒绝过的可选参数，直接不再发送，省掉一次注定失败的请求。
+    rejected = known_rejected_params(provider_id, model)
+    if rejected and output_options:
+        skipped = [key for key in output_options if key in rejected]
+        if skipped:
+            output_options = {key: value for key, value in output_options.items() if key not in rejected}
+            note_ignored_params(notes, skipped)
+            print(f"[image] {provider_id}/{model} 跳过历史拒绝的参数 {skipped}")
     if is_tudou_provider(provider):
         model = tudou_image_model_for_request(model)
     if provider["id"] == "modelscope":
@@ -11301,12 +11691,28 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
     image_refs = [ref for ref in refs if ref not in mask_refs]
     image_request_mode = effective_image_request_mode(provider, model)
     request_timeout = httpx.Timeout(connect=20.0, read=1800.0, write=120.0, pool=20.0) if (is_gpt2 or is_apimart or image_request_mode in {"openai-json", "openai-video-proxy", "openai-responses"}) else AI_REQUEST_TIMEOUT
-    async with httpx.AsyncClient(timeout=request_timeout) as client:
+    # 生图请求耗时可能很长，开始/结束都打一行日志，出问题时能一眼看出卡在提交还是轮询。
+    _gen_started = time.monotonic()
+    print(
+        f"[image] 开始 provider={provider['id']} model={model} mode={image_request_mode} "
+        f"size={size} refs={len(image_refs)} endpoint={gen_url}",
+        flush=True,
+    )
+    async with httpx.AsyncClient(timeout=request_timeout) as _raw_client:
+        # 大 JSON 响应被中途掐断时自动重发一次（只针对不带文件的 POST）
+        client = RetryingImagePostClient(_raw_client)
         response = None
-        async def post_openai_edits(edit_files=None):
-            data = {"model": model, "prompt": prompt, "size": size}
+        def default_edit_params():
+            params = dict(output_options or {})
             if quality:
-                data["quality"] = quality
+                params.setdefault("quality", quality)
+            return params
+
+        async def post_openai_edits(edit_files=None, params=None):
+            data = {"model": model, "prompt": prompt, "size": size}
+            # multipart 表单字段必须是字符串
+            for key, value in (params if params is not None else default_edit_params()).items():
+                data[key] = str(value)
             return await client.post(
                 edit_url,
                 headers=api_headers(json_body=False, provider=provider, model=model),
@@ -11407,54 +11813,89 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
             }
             if image_refs:
                 body["image_urls"] = [reference_to_data_url(ref, max_size=1536) for ref in image_refs[:ONLINE_IMAGE_REFERENCE_MAX]]
-            response = await client.post(gen_url, headers=api_headers(provider=provider, model=model), json=body)
+            if output_options:
+                body.update(output_options)
+
+            async def _send_apimart(params):
+                return await client.post(gen_url, headers=api_headers(provider=provider, model=model), json=params)
+
+            # 部分中转不透传 background / output_format 等新参数，按报错点名的字段逐个剔除后重试。
+            response, dropped, _applied = await send_with_optional_param_retry(
+                _send_apimart, body, OPTIONAL_IMAGE_PARAMS,
+                provider_id=provider["id"], model=model, label=f"APIMart {model}",
+            )
+            note_ignored_params(notes, dropped)
         elif is_gpt2 and not image_refs and not mask_refs:
             body = {"model": model, "prompt": prompt, "size": size}
             if quality:
                 body["quality"] = quality
-            response = await client.post(gen_url, headers=api_headers(provider=provider, model=model), json=body)
+            body.update(output_options or {})
+
+            async def _send_gpt_gen(params):
+                return await client.post(gen_url, headers=api_headers(provider=provider, model=model), json=params)
+
+            response, dropped, applied = await send_with_optional_param_retry(
+                _send_gpt_gen, body, OPTIONAL_IMAGE_PARAMS,
+                provider_id=provider["id"], model=model, label=f"生图 {model}",
+            )
+            note_ignored_params(notes, dropped)
             if response.status_code >= 400 and images_api_unsupported(response):
-                response = await post_openai_edits()
+                # 回退到 edits 时沿用实际生效的参数，避免又把刚被拒的字段发一遍。
+                response = await post_openai_edits(None, {k: v for k, v in applied.items() if k in OPTIONAL_IMAGE_PARAMS})
         elif image_refs:
             # 1) OpenAI 协议的图生图/编辑用 multipart 提交到 /images/edits；
             # GPT-Image-2 参考图不能走 /images/generations JSON，否则部分平台会忽略原图或报 Images API unsupported。
-            files = []
-            opened = []
             edit_failed_status = None
             edit_failed_text = ""
-            try:
-                for ref in image_refs[:ONLINE_IMAGE_REFERENCE_MAX]:
-                    path = output_file_from_url(ref.get("url", ""))
-                    if not path:
-                        continue
-                    fh = open(path, "rb")
-                    opened.append(fh)
-                    files.append(("image", (os.path.basename(path), fh, content_type_for_path(path))))
-                if mask_refs:
-                    mask_path = output_file_from_url(mask_refs[0].get("url", ""))
+            ref_paths = []
+            for ref in image_refs[:ONLINE_IMAGE_REFERENCE_MAX]:
+                path = output_file_from_url(ref.get("url", ""))
+                if path:
+                    ref_paths.append(path)
+            mask_path = ""
+            if mask_refs:
+                mask_path = output_file_from_url(mask_refs[0].get("url", "")) or ""
+
+            async def _send_edit(params):
+                # 每次尝试都重新打开文件句柄：multipart 第一次请求后句柄已读到末尾，
+                # 复用同一批句柄会让重试请求发出 0 字节的文件。
+                opened = []
+                files = []
+                try:
+                    for path in ref_paths:
+                        fh = open(path, "rb")
+                        opened.append(fh)
+                        files.append(("image", (os.path.basename(path), fh, content_type_for_path(path))))
                     if mask_path:
                         fh = open(mask_path, "rb")
                         opened.append(fh)
                         files.append(("mask", (os.path.basename(mask_path), fh, content_type_for_path(mask_path))))
-                try:
-                    response = await post_openai_edits(files)
-                    if response.status_code >= 400:
-                        edit_failed_status = response.status_code
-                        edit_failed_text = response.text[:500]
-                        response = None
-                except httpx.HTTPError as e:
-                    edit_failed_status = -1
-                    edit_failed_text = str(e)
+                    return await post_openai_edits(files, params)
+                finally:
+                    for fh in opened:
+                        fh.close()
+
+            try:
+                response, dropped, _applied = await send_with_optional_param_retry(
+                    _send_edit, default_edit_params(), OPTIONAL_IMAGE_PARAMS,
+                    provider_id=provider["id"], model=model, label=f"编辑 {model}",
+                )
+                note_ignored_params(notes, dropped)
+                if response.status_code >= 400:
+                    edit_failed_status = response.status_code
+                    edit_failed_text = response.text[:500]
                     response = None
-            finally:
-                for fh in opened:
-                    fh.close()
+            except httpx.HTTPError as e:
+                edit_failed_status = -1
+                edit_failed_text = str(e)
+                response = None
             # 2) edits 失败 → 非 GPT-Image-2 可回退到 /images/generations + JSON image:[urls/base64]（grsai 风格）
             if response is None:
                 if is_gpt2:
+                    friendly = friendly_image_error_detail(edit_failed_text, size, model)
                     raise HTTPException(
                         status_code=502,
-                        detail=f"GPT-Image-2 编辑接口 /images/edits 调用失败：{edit_failed_text[:300] or edit_failed_status}。已停止自动重试，避免上游可能已扣费后再次请求。"
+                        detail=friendly or f"GPT-Image-2 编辑接口 /images/edits 调用失败：{edit_failed_text[:300] or edit_failed_status}。已停止自动重试，避免上游可能已扣费后再次请求。"
                     )
                 print(f"/images/edits failed ({edit_failed_status}): {edit_failed_text[:200]} → 回退到 /images/generations + image:[] JSON")
                 image_payload = [reference_to_data_url(ref, max_size=1536) for ref in image_refs[:ONLINE_IMAGE_REFERENCE_MAX]]
@@ -11483,6 +11924,11 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
             if response.status_code >= 400 and images_api_unsupported(response):
                 response = await post_openai_edits()
         response.raise_for_status()
+        print(
+            f"[image] 上游响应 provider={provider['id']} model={model} status={response.status_code} "
+            f"耗时={time.monotonic() - _gen_started:.1f}s",
+            flush=True,
+        )
         raw = response.json()
         try:
             return extract_image(raw), raw
@@ -11499,6 +11945,16 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
             task_id = extract_task_id(raw)
             if not task_id:
                 raise
+            # 上游没有直接给图而是给了任务号：这里必须留痕，
+            # 否则一旦轮询地址不对，日志里只有“没有报错但一直生成中”。
+            try:
+                print(
+                    f"[image-task] 上游未直接返回图片，转任务轮询 model={model} provider={provider['id']} "
+                    f"mode={image_request_mode} task_id={task_id} 原始响应={json.dumps(raw, ensure_ascii=False)[:300]}",
+                    flush=True,
+                )
+            except Exception:
+                pass
         try:
             task_result = await wait_for_image_task(client, task_id, provider)
             return extract_image(task_result), task_result
@@ -14070,6 +14526,12 @@ async def build_online_image_result(payload: OnlineImageRequest):
     image_refs = image_references(refs)
     count = max(1, min(8, int(payload.n or 1)))
     operation = str(payload.operation or "").strip().lower()
+    # 被上游拒绝、已自动忽略的可选参数（例如映射后的模型不支持 input_fidelity）
+    ignored_params = []
+    output_options = gpt_image_output_options(
+        model, payload.output_format, payload.output_compression,
+        payload.background, payload.input_fidelity,
+    )
     if operation == "upscale":
         if not is_jimeng_provider(provider):
             raise HTTPException(status_code=400, detail="图片放大目前仅支持即梦（Dreamina）平台")
@@ -14082,7 +14544,7 @@ async def build_online_image_result(payload: OnlineImageRequest):
         else:
             image_data, raw_item = await generate_ai_image(
                 payload.prompt, request_size, payload.quality, model, image_refs, provider["id"],
-                payload.aspect_ratio, payload.resolution,
+                payload.aspect_ratio, payload.resolution, output_options, ignored_params,
             )
         try:
             image_items = extract_images(raw_item) if isinstance(raw_item, dict) else [image_data]
@@ -14106,7 +14568,11 @@ async def build_online_image_result(payload: OnlineImageRequest):
         raise HTTPException(status_code=exc.response.status_code, detail=detail) from exc
     except httpx.HTTPError as exc:
         log_net_error(f"生图 网络/TLS错误 provider={provider.get('id')} model={model}", exc)
-        raise HTTPException(status_code=502, detail=f"请求上游生图接口失败：{exc}") from exc
+        transport_detail = transport_error_detail(exc)
+        raise HTTPException(
+            status_code=502,
+            detail=transport_detail or f"请求上游生图接口失败：{exc}",
+        ) from exc
 
     local_urls = [url for urls, _items, _raw in generated for url in (urls or []) if url]
     local_items = [item for _urls, items, _raw in generated for item in (items or []) if item.get("url")]
@@ -14126,7 +14592,7 @@ async def build_online_image_result(payload: OnlineImageRequest):
         "provider_name": provider.get("name") or provider["id"],
         "task_id": extract_task_id(raw) if isinstance(raw, dict) else None,
         "request_id": raw.get("id") if isinstance(raw, dict) else None,
-        "params": {"provider_id": provider["id"], "model": model, "size": request_size, "requested_size": payload.size, "quality": payload.quality, "n": count, "reference_images": refs},
+        "params": {"provider_id": provider["id"], "model": model, "size": request_size, "requested_size": payload.size, "quality": payload.quality, "n": count, "reference_images": refs, "output_options": output_options, "ignored_params": ignored_params},
         "raw_usage": raw.get("usage") if isinstance(raw, dict) else None,
     }
     save_to_history(result)
@@ -17842,6 +18308,320 @@ async def get_queue_status(client_id: str):
         position = positions[0] if positions else 0
     return {"total": total, "position": position}
 
+# --- 任务中心：统一任务视图 / 收藏评分 / 用量统计 ---
+
+TASK_META_FILE = os.path.join(DATA_DIR, "task_meta.json")
+TASK_META_LOCK = Lock()
+
+def _task_key(item):
+    """为历史记录生成稳定 key：时间戳(3位小数) + task_id 或首图文件名。"""
+    ts = item.get("timestamp") or 0
+    try:
+        ts_part = f"{float(ts):.3f}"
+    except (TypeError, ValueError):
+        ts_part = "0.000"
+    ident = item.get("task_id") or ""
+    if not ident:
+        images = item.get("images") or []
+        ident = os.path.basename(str(images[0])) if images else ""
+    return f"{ts_part}|{ident}"
+
+def _history_records():
+    """读取 history.json，补上 _ts / _key 并按时间倒序返回。"""
+    if not os.path.exists(HISTORY_FILE):
+        return []
+    try:
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as exc:
+        print(f"读取历史文件失败: {exc}")
+        return []
+    if not isinstance(data, list):
+        return []
+    records = []
+    for item in data:
+        if not isinstance(item, dict) or not item.get("images"):
+            continue
+        try:
+            ts = float(item.get("timestamp") or 0)
+        except (TypeError, ValueError):
+            ts = 0.0
+        item["_ts"] = ts
+        item["_key"] = _task_key(item)
+        records.append(item)
+    records.sort(key=lambda x: x["_ts"], reverse=True)
+    return records
+
+def _load_task_meta():
+    if not os.path.exists(TASK_META_FILE):
+        return {}
+    try:
+        with open(TASK_META_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        print(f"读取任务标记失败: {exc}")
+        return {}
+
+def _save_task_meta(meta):
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        tmp_path = TASK_META_FILE + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, TASK_META_FILE)
+    except Exception as exc:
+        print(f"保存任务标记失败: {exc}")
+        raise HTTPException(status_code=500, detail=f"保存任务标记失败: {exc}")
+
+def _task_usage(item):
+    """从 raw_usage 里取 token 总量，兼容不同供应商的字段命名。"""
+    usage = item.get("raw_usage")
+    if not isinstance(usage, dict):
+        return 0
+    for key in ("total_tokens", "total_token_count"):
+        value = usage.get(key)
+        if isinstance(value, (int, float)):
+            return int(value)
+    total = 0
+    for key in ("input_tokens", "output_tokens", "prompt_tokens", "completion_tokens"):
+        value = usage.get(key)
+        if isinstance(value, (int, float)):
+            total += int(value)
+    return total
+
+def _compact_task(item, meta):
+    entry = meta.get(item["_key"]) or {}
+    images = [img for img in (item.get("images") or []) if img]
+    image_items = []
+    for raw in (item.get("image_items") or [])[:4]:
+        if not isinstance(raw, dict):
+            continue
+        image_items.append({
+            "url": raw.get("url"),
+            "name": raw.get("name"),
+            "width": raw.get("width"),
+            "height": raw.get("height"),
+            "kind": raw.get("kind"),
+        })
+    return {
+        "key": item["_key"],
+        "timestamp": item["_ts"],
+        "type": item.get("type") or "zimage",
+        "model": item.get("model") or "",
+        "provider_id": item.get("provider_id") or "",
+        "provider_name": item.get("provider_name") or "",
+        "prompt": item.get("prompt") or "",
+        "images": images[:4],
+        "image_items": image_items,
+        "image_count": len(images),
+        "tokens": _task_usage(item),
+        "favorite": bool(entry.get("favorite")),
+        "rating": int(entry.get("rating") or 0),
+        "params": item.get("params") or {},
+    }
+
+def _queue_snapshot():
+    now = time.time()
+    with QUEUE_LOCK:
+        items = []
+        for index, task in enumerate(QUEUE):
+            started = task.get("started_at")
+            items.append({
+                "task_id": task.get("task_id"),
+                "position": index + 1,
+                "type": task.get("type") or "comfyui",
+                "workflow": task.get("workflow") or "",
+                "prompt": task.get("prompt") or "",
+                "elapsed": round(now - started, 1) if isinstance(started, (int, float)) else 0,
+            })
+    return {"total": len(items), "items": items}
+
+class TaskKeyRequest(BaseModel):
+    key: str
+    favorite: Optional[bool] = None
+    rating: Optional[int] = None
+
+class TaskKeysRequest(BaseModel):
+    keys: List[str] = []
+
+@app.get("/api/tasks")
+async def list_tasks(q: str = "", type: str = "", provider_id: str = "",
+                     favorite: int = 0, days: int = 0, offset: int = 0,
+                     limit: int = 48, sort: str = "new"):
+    records = _history_records()
+    meta = _load_task_meta()
+    keyword = (q or "").strip().lower()
+    now = time.time()
+    items = []
+    for item in records:
+        if days and days > 0 and item["_ts"] < now - days * 86400:
+            continue
+        if type and (item.get("type") or "zimage") != type:
+            continue
+        if provider_id and (item.get("provider_id") or "") != provider_id:
+            continue
+        entry = meta.get(item["_key"]) or {}
+        if favorite and not entry.get("favorite"):
+            continue
+        if keyword:
+            haystack = " ".join([
+                str(item.get("prompt") or ""),
+                str(item.get("model") or ""),
+                str(item.get("provider_name") or ""),
+            ]).lower()
+            if keyword not in haystack:
+                continue
+        items.append(_compact_task(item, meta))
+    if sort == "old":
+        items.sort(key=lambda x: x["timestamp"])
+    elif sort == "rating":
+        items.sort(key=lambda x: (-x["rating"], -x["timestamp"]))
+    else:
+        items.sort(key=lambda x: x["timestamp"], reverse=True)
+    total = len(items)
+    offset = max(0, int(offset or 0))
+    limit = max(1, min(int(limit or 48), 200))
+    types = sorted({(r.get("type") or "zimage") for r in records})
+    providers = sorted({
+        (r.get("provider_name") or r.get("provider_id") or "")
+        for r in records if (r.get("provider_name") or r.get("provider_id"))
+    })
+    return {
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "items": items[offset:offset + limit],
+        "filters": {"types": types, "providers": providers},
+    }
+
+@app.get("/api/stats/overview")
+async def stats_overview(days: int = 14):
+    records = _history_records()
+    meta = _load_task_meta()
+    days = max(1, min(int(days or 14), 90))
+    now = time.time()
+    today_key = time.strftime("%Y-%m-%d", time.localtime(now))
+    day_counts, type_counts, provider_counts, model_counts = {}, {}, {}, {}
+    total_images = total_tokens = favorites = today_count = week_count = 0
+    for item in records:
+        ts = item["_ts"]
+        day = time.strftime("%Y-%m-%d", time.localtime(ts)) if ts else ""
+        if day:
+            day_counts[day] = day_counts.get(day, 0) + 1
+        if day == today_key:
+            today_count += 1
+        if ts >= now - 7 * 86400:
+            week_count += 1
+        kind = item.get("type") or "zimage"
+        type_counts[kind] = type_counts.get(kind, 0) + 1
+        provider = item.get("provider_name") or item.get("provider_id") or "未知"
+        provider_counts[provider] = provider_counts.get(provider, 0) + 1
+        model = item.get("model") or "未标注"
+        model_counts[model] = model_counts.get(model, 0) + 1
+        total_images += len(item.get("images") or [])
+        total_tokens += _task_usage(item)
+        if (meta.get(item["_key"]) or {}).get("favorite"):
+            favorites += 1
+    series = []
+    for i in range(days - 1, -1, -1):
+        day = time.strftime("%Y-%m-%d", time.localtime(now - i * 86400))
+        series.append({"date": day, "count": day_counts.get(day, 0)})
+
+    def top(counter, limit=8):
+        return [{"name": k, "count": v}
+                for k, v in sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]]
+
+    return {
+        "totals": {
+            "tasks": len(records),
+            "images": total_images,
+            "today": today_count,
+            "week": week_count,
+            "favorites": favorites,
+            "tokens": total_tokens,
+            "types": len(type_counts),
+            "providers": len([p for p in provider_counts if p != "未知"]),
+        },
+        "series": series,
+        "by_type": top(type_counts),
+        "by_provider": top(provider_counts),
+        "by_model": top(model_counts),
+        "queue": _queue_snapshot(),
+    }
+
+@app.post("/api/tasks/favorite")
+async def toggle_task_favorite(req: TaskKeyRequest):
+    if not req.key:
+        raise HTTPException(status_code=400, detail="缺少任务 key")
+    with TASK_META_LOCK:
+        meta = _load_task_meta()
+        entry = meta.get(req.key) or {}
+        if req.favorite is None:
+            entry["favorite"] = not bool(entry.get("favorite"))
+        else:
+            entry["favorite"] = bool(req.favorite)
+        meta[req.key] = entry
+        _save_task_meta(meta)
+    return {"success": True, "key": req.key, "favorite": entry["favorite"]}
+
+@app.post("/api/tasks/rating")
+async def set_task_rating(req: TaskKeyRequest):
+    if not req.key:
+        raise HTTPException(status_code=400, detail="缺少任务 key")
+    rating = max(0, min(int(req.rating or 0), 5))
+    with TASK_META_LOCK:
+        meta = _load_task_meta()
+        entry = meta.get(req.key) or {}
+        entry["rating"] = rating
+        if rating == 0 and not entry.get("favorite"):
+            meta.pop(req.key, None)
+        else:
+            meta[req.key] = entry
+        _save_task_meta(meta)
+    return {"success": True, "key": req.key, "rating": rating}
+
+@app.post("/api/tasks/delete")
+async def delete_tasks(req: TaskKeysRequest):
+    """仅从历史记录中移除，不删除磁盘上的图片文件。"""
+    keys = {k for k in (req.keys or []) if k}
+    if not keys:
+        return {"success": False, "message": "未选择任务", "deleted": 0}
+    if not os.path.exists(HISTORY_FILE):
+        return {"success": False, "message": "历史文件不存在", "deleted": 0}
+    deleted = 0
+    with HISTORY_LOCK:
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                history = json.load(f)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"读取历史失败: {exc}")
+        if not isinstance(history, list):
+            history = []
+        kept = []
+        for item in history:
+            if isinstance(item, dict) and _task_key(item) in keys:
+                deleted += 1
+                continue
+            kept.append(item)
+        if deleted:
+            tmp_path = HISTORY_FILE + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(kept, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, HISTORY_FILE)
+    if deleted:
+        with TASK_META_LOCK:
+            meta = _load_task_meta()
+            for key in keys:
+                meta.pop(key, None)
+            _save_task_meta(meta)
+    return {"success": True, "deleted": deleted}
+
+@app.get("/api/queue/detail")
+async def queue_detail():
+    return _queue_snapshot()
+
+
 @app.post("/api/history/delete")
 async def delete_history(req: DeleteHistoryRequest):
     if not os.path.exists(HISTORY_FILE):
@@ -18253,7 +19033,14 @@ def generate(req: GenerateRequest):
     with QUEUE_LOCK:
         task_id = NEXT_TASK_ID
         NEXT_TASK_ID += 1
-        current_task = {"task_id": task_id, "client_id": req.client_id}
+        current_task = {
+            "task_id": task_id,
+            "client_id": req.client_id,
+            "type": req.type or "comfyui",
+            "workflow": req.workflow_json or "",
+            "prompt": (req.prompt or "")[:120],
+            "started_at": time.time(),
+        }
         QUEUE.append(current_task)
 
     try:
