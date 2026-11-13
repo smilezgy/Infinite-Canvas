@@ -9918,8 +9918,12 @@ def known_rejected_params(provider_id, model):
 def remember_rejected_params(provider_id, model, dropped):
     if not dropped:
         return
+    # frame_count / size 属于「被自动调小」而不是「不被支持」，不能记进拒绝缓存：
+    # 否则以后所有请求都不带它们（size 更是必需参数），反而直接失败。
     key = (str(provider_id or ""), str(model or "").strip().lower())
-    IMAGE_PARAM_REJECT_CACHE.setdefault(key, set()).update(dropped)
+    IMAGE_PARAM_REJECT_CACHE.setdefault(key, set()).update(
+        name for name in dropped if name not in {"frame_count", "size"}
+    )
 
 
 def note_ignored_params(notes, dropped):
@@ -9929,6 +9933,91 @@ def note_ignored_params(notes, dropped):
     for key in dropped:
         if key not in notes:
             notes.append(key)
+
+
+def compression_conflict_params(text, candidates=OPTIONAL_IMAGE_PARAMS):
+    """识别“输出格式被忽略后，压缩参数反而冲突”这类 400。
+
+    实测某些中转会**静默丢弃** output_format（例如把 webp 当成 png 处理），
+    报文既不点名参数、也不提格式，只说压缩率不被接受：
+        "Compression less than 100 is not supported for PNG output format"
+    这种报文里没有参数名，靠 unsupported_request_params 识别不到，
+    但 compression 这个词足以确定该去掉 output_compression 再试一次。
+    """
+    lower = str(text or "").lower()
+    if "compression" not in lower:
+        return []
+    if not any(token in lower for token in ("not supported", "unsupported", "is not allowed", "invalid")):
+        return []
+    allowed = {str(name).lower() for name in (candidates or ())}
+    return ["output_compression"] if "output_compression" in allowed else []
+
+
+def gif_frame_budget_fix(text, params):
+    """GIF 帧数放不下时，把帧数降到平台大概率能塞进像素预算的值。
+
+    实测报文（newapi 类中转）：
+        "No supported sheet fits 9 GIF frames at size '1024x1024'.
+         Invalid size '3072x3072'. Requested resolution exceeds the current pixel budget."
+    平台会把每帧放大到请求尺寸再拼成 sheet：9 帧即 3072x3072（943 万像素），
+    超过 GPT Image 约 829 万的像素预算；4 帧只需 2048x2048（419 万），在预算内。
+    400 表示请求被拒、尚未生成也不会计费，所以这次重试是安全的。
+    """
+    lower = str(text or "").lower()
+    if "gif" not in lower or "pixel budget" not in lower:
+        return None
+    # 报文提到 sheet / pixel budget → 问题在「拼版总尺寸」，与帧数无关；
+    # 实测多数平台还会静默忽略 frame_count，这时减帧数只是白费一次往返，改走缩尺寸。
+    if "sheet" in lower:
+        return None
+    try:
+        count = int(params.get("frame_count"))
+    except (TypeError, ValueError):
+        return None
+    if count <= GIF_FRAME_BUDGET_SAFE_COUNT:
+        return None
+    return GIF_FRAME_BUDGET_SAFE_COUNT
+
+
+def gif_size_budget_fix(text, size):
+    """GIF 拼版超出平台像素预算时，按报文反推出能放得下的单帧尺寸。
+
+    实测报文：
+        "No supported sheet fits 9 GIF frames at size '1024x1024'.
+         Invalid size '3072x3072'. Requested resolution exceeds the current pixel budget."
+    平台把每帧放大到请求尺寸后按 factor×factor 拼成 sheet（这里是 3×3），
+    3072x3072 = 943 万像素超过 GPT Image 约 829 万的预算。
+    反推 factor 后即可算出能放得下的单帧边长：829 万 / 9 ≈ 92 万 → 944px。
+
+    实测该平台还会**静默忽略** frame_count（传 2 仍按 9 帧拼），
+    所以真正能救 GIF 的变量是尺寸，不是帧数。
+    400 表示请求被拒、尚未生成也不计费，重试是安全的。
+    """
+    lower = str(text or "").lower()
+    if "gif" not in lower or "pixel budget" not in lower:
+        return None
+    m = re.search(r"invalid size '(\d{2,5})x(\d{2,5})'", lower)
+    if not m:
+        return None
+    sheet_w, sheet_h = int(m.group(1)), int(m.group(2))
+    width, height = parse_size_pair(size)
+    if not width or not height or not sheet_w or not sheet_h:
+        return None
+    factor_w = max(1, round(sheet_w / width))
+    factor_h = max(1, round(sheet_h / height))
+    budget = GPT_IMAGE2_MAX_PIXELS / float(factor_w * factor_h)
+    # 留 5% 余量：算出来的值往往正好卡在预算上限（960→拼版 2880² 恰好等于上限），
+    # 平台按「超过」判定时仍会拒，余量能一次过。
+    side = int((budget ** 0.5) * 0.95 // 16 * 16)
+    new_width = max(16, (min(width, side) // 16) * 16)
+    new_height = max(16, (min(height, side) // 16) * 16)
+    if new_width == width and new_height == height:
+        # 按当前尺寸反推仍然超预算：直接再缩 25%
+        new_width = max(16, (width * 3 // 4 // 16) * 16)
+        new_height = max(16, (height * 3 // 4 // 16) * 16)
+        if new_width == width and new_height == height:
+            return None
+    return f"{new_width}x{new_height}"
 
 
 async def send_with_optional_param_retry(send, params, candidates=OPTIONAL_IMAGE_PARAMS,
@@ -9949,15 +10038,37 @@ async def send_with_optional_param_retry(send, params, candidates=OPTIONAL_IMAGE
     response = await send(current)
     rounds = 0
     while getattr(response, "status_code", 0) == 400 and rounds < max_rounds:
-        bad = unsupported_request_params(getattr(response, "text", ""), candidates)
+        body = getattr(response, "text", "")
+        bad = unsupported_request_params(body, candidates)
         if not bad:
-            break
+            # 报文没点名参数时，只认几种可安全重试的情况
+            bad = compression_conflict_params(body, candidates)
+            if not bad:
+                smaller = gif_frame_budget_fix(body, current)
+                if smaller is not None:
+                    current["frame_count"] = smaller
+                    if "frame_count" not in dropped:
+                        dropped.append("frame_count")
+                    rounds += 1
+                    print(f"[image] {label or model} GIF 帧数超出平台像素预算，已降到 {smaller} 帧重试（第 {rounds} 次）")
+                    response = await send(current)
+                    continue
+                new_size = gif_size_budget_fix(body, current.get("size"))
+                if new_size:
+                    current["size"] = new_size
+                    if "size" not in dropped:
+                        dropped.append("size")
+                    rounds += 1
+                    print(f"[image] {label or model} GIF 拼版超出平台像素预算，已缩小尺寸到 {new_size} 重试（第 {rounds} 次）")
+                    response = await send(current)
+                    continue
+                break
         for key in bad:
             current.pop(key, None)
             if key not in dropped:
                 dropped.append(key)
         rounds += 1
-        print(f"[image] {label or model} 上游不支持参数 {bad}，已剔除后重试（第 {rounds} 次）")
+        print(f"[image] {label or model} 上游不接受参数 {bad}，已剔除后重试（第 {rounds} 次）")
         response = await send(current)
     if dropped:
         remember_rejected_params(provider_id, model, dropped)
@@ -10033,6 +10144,8 @@ GPT_IMAGE_COMPLEXITY_LEVELS = ("low", "medium", "high")
 GPT_IMAGE_GIF_FRAME_COUNT_MIN = 2
 GPT_IMAGE_GIF_FRAME_COUNT_MAX = 16
 GPT_IMAGE_GIF_FRAME_DURATION_MIN = 20
+# 平台把每帧拼成 sheet，帧数越多 sheet 越大；4 帧是实测能落进像素预算的档位
+GIF_FRAME_BUDGET_SAFE_COUNT = 4
 
 
 def gpt_image_output_options(model, output_format="", output_compression=None,
@@ -10232,10 +10345,31 @@ def friendly_image_error_detail(text, size="", model=""):
             f"系统已自动去掉该参数重试，但本次仍未成功，请关闭对应的输出选项（透明背景 / 输出格式 / 编辑保真）后再生成。"
             f"原始报错：{text[:160]}"
         )
+    # 平台静默丢弃了 output_format（实际按 PNG 处理），PNG 又不接受小于 100 的压缩率。
+    if "compression" in lower_text and any(t in lower_text for t in ("not supported", "unsupported", "invalid")):
+        return (
+            "该平台忽略了「输出格式」设置，实际仍按 PNG 输出，而 PNG 不接受小于 100 的压缩率。"
+            "系统已自动去掉压缩参数重试；若必须拿到 WebP/JPEG，请换一个支持输出格式的平台，"
+            f"或把压缩质量调到 100。原始报错：{text[:160]}"
+        )
+    # GIF 动图：平台把所有帧拼进一张 sheet 再编码，尺寸大了就超出像素预算。
+    if "gif" in lower_text and any(t in lower_text for t in ("frame", "sheet", "pixel budget")):
+        return (
+            "该平台的 GIF 输出受像素预算限制：它把每一帧放大到请求尺寸后拼成一张大图，"
+            "再整张编码，尺寸越大越容易超限（报错里的尺寸是平台自己尝试的拼版尺寸，不是你选的尺寸）。"
+            "另外多数平台会忽略「GIF 帧数」设置，所以减帧数不一定有用。\n"
+            "建议：① 把画布调小（例如 512x512）；② 或改用静态图格式；"
+            f"③ 若必须大尺寸 GIF，请换一个支持动图的平台。原始报错：{text[:200]}"
+        )
     if is_gpt_image_2_model(model) and gpt_image_2_size_exceeds_supported(size):
         return gpt_image_2_size_error_message(size)
     mentions_size = any(token in lower_text for token in ["size", "resolution", "dimension"])
-    is_gpt_size_error = is_gpt_image_2_model(model) and mentions_size and (
+    # 报文里若出现了与我们请求不同的具体尺寸，那是平台自己尝试的拼版/换算尺寸，
+    # 不能当成“用户选的尺寸非法”，否则会给出完全误导的提示。
+    requested = str(size or "").strip().lower().replace(" ", "")
+    reported_sizes = {f"{w}x{h}" for w, h in re.findall(r"(\d{2,5})\s*[x×]\s*(\d{2,5})", lower_text)}
+    other_size_reported = bool(reported_sizes) and (requested not in reported_sizes)
+    is_gpt_size_error = is_gpt_image_2_model(model) and mentions_size and not other_size_reported and (
         "invalid" in lower_text
         or "unsupported" in lower_text
         or "not supported" in lower_text
@@ -10253,9 +10387,12 @@ def friendly_image_error_detail(text, size="", model=""):
         pixel_match = re.search(r"at least (\d+) pixels", lower_text)
         pixels = pixel_match.group(1) if pixel_match else "3686400"
         return f"该模型要求更高分辨率，当前尺寸 {size or '过小'} 不满足最低像素要求（至少 {pixels} 像素）。火山 Seedream 5.0 建议从 2K 起步。"
-    if is_gpt_size_error or (("invalid size" in lower_text or "invalid_value" in lower_text) and is_gpt_image_2_model(model)):
+    if is_gpt_size_error or (("invalid size" in lower_text or "invalid_value" in lower_text) and is_gpt_image_2_model(model) and not other_size_reported):
         return gpt_image_2_size_error_message(size)
     if "invalid size" in lower_text or "invalid_value" in lower_text:
+        # 报文里的尺寸与我们请求的不一致 → 多半是平台自己的换算尺寸，说明原始报文更有用
+        if other_size_reported:
+            return f"该平台对本次请求的尺寸做了换算后被上游拒绝，与你选的尺寸无关。原始报错：{text[:200]}"
         return f"该模型不支持当前尺寸：{size or '未指定'}。请尝试更换分辨率或模型。"
     if any(token in text for token in ("裸露", "色情", "情色", "防护限制", "安全策略", "内容审核", "敏感内容")) or any(
         token in lower_text for token in ("safety_violation", "moderation_blocked", "sensitive_content", "sexual")
@@ -14650,8 +14787,10 @@ async def build_online_image_result(payload: OnlineImageRequest):
     try:
         generated = await asyncio.gather(*(generate_one() for _ in range(count)))
     except httpx.HTTPStatusError as exc:
-        log_net_error(f"生图 HTTP状态错误 provider={provider.get('id')} model={model} size={request_size}", exc)
         text = exc.response.text or ''
+        # 上游原始报文必须留痕：友好文案是二次加工的结果，排查时要看的是原文
+        print(f"[image] 上游返回 {exc.response.status_code} 原文：{text[:600]}", flush=True)
+        log_net_error(f"生图 HTTP状态错误 provider={provider.get('id')} model={model} size={request_size}", exc)
         friendly = friendly_image_error_detail(text, request_size, model)
         detail = friendly or f"上游生图接口错误：{text[:300]}"
         raise HTTPException(status_code=exc.response.status_code, detail=detail) from exc

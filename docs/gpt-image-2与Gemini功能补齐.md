@@ -389,3 +389,62 @@ base64 图片的 JSON 动辄 2~4MB，正好是最容易被中间设备掐掉的�
 - `svg.model` / `svg.reasoning.effort`（需 SVG 模型选择权限）
 - `safety_identifier`、`moderation`、`partial_images`
 - 画布节点里的输出格式/背景/复杂度控件（画布当前只透传 quality，未接 gpt-image 输出控制，2.0 时代同样缺失）
+
+---
+
+## 十三、线上排障：400 被误报成「尺寸超限」（2026-11-13）
+
+### 现象
+
+在 `newapi.lkkcdn.com`（provider `custom-api-7`，模型 `gpt-image-2.6-flare`）出图，
+上游回 400，但界面提示却是：
+
+> GPT-Image-2 不支持当前尺寸 1024x1024：它有最大像素限制（长边最大 3840、总像素约 829 万）……
+
+1024x1024 远在限制之内，**提示完全指错了方向**。
+
+### 实测上游行为（直连该平台复现）
+
+| 请求 | 结果 |
+|---|---|
+| `model+prompt+size` | 200，正常出图 |
+| `+complexity+quality=xhigh+background` | 200，正常出图 |
+| `+output_format=webp + output_compression=80` | 400 `Compression less than 100 is not supported for PNG output format` —— 平台**静默丢弃** output_format，仍按 PNG 处理 |
+| `+output_format=svg` | 200，出的是 SVG |
+| `+output_format=gif, frame_count=9, size=1024x1024` | 400 `No supported sheet fits 9 GIF frames at size '1024x1024'. Invalid size '3072x3072'. Requested resolution exceeds the current pixel budget.` |
+| `+output_format=gif, frame_count=2`（同样是 1024x1024） | 400，报错里**仍是 9 frames** → 平台忽略 frame_count |
+| `+output_format=gif, size=512x512` | 200，出的是 GIF |
+| `+input_fidelity=high` | 400 `Unknown parameter: 'input_fidelity'.` |
+
+三条关键事实：
+
+1. 该平台**静默忽略** `output_format`（webp 被当 PNG），随后压缩参数才暴露冲突；
+2. 该平台**忽略** `frame_count`，GIF 固定 9 帧拼 3×3 sheet → 1024×1024 时拼版 3072×3072（943 万）超 829 万预算；
+3. `input_fidelity` 确实不被接受 —— 上一节的「2 系不发 input_fidelity」改动正好命中。
+
+### 三个缺陷与修法
+
+| 缺陷 | 修法 |
+|---|---|
+| 尺寸误判：报文里的 `Invalid size '3072x3072'` 是平台自己的拼版尺寸，与用户请求的 1024x1024 不同，却被当成用户尺寸非法 | 比对报文里出现的具体尺寸与本次请求尺寸，不同则不判为尺寸问题；GIF 类报错单独出文案 |
+| 平台不点名参数时降级机制失效（压缩冲突报文里没有参数名） | 新增 `compression_conflict_params()`：报文含 compression + 不支持语义时，剔除 `output_compression` 重试一次（400 未生成、不计费，安全） |
+| GIF 拼版超预算无解 | 新增 `gif_size_budget_fix()`：从报文的 `Invalid size '3072x3072'` 反推拼版倍率（3×3），再按像素预算算出可用单帧尺寸（留 5% 余量 → 912×912）并重试；因为平台忽略帧数，降帧只在报文不涉及 sheet 时才尝试，避免白费往返 |
+
+另外两条配套改动：
+
+- `frame_count` / `size` **不写进**拒绝参数缓存（它们是「被自动调小」，不是「不被支持」；
+  尤其 size 是必需参数，一旦被缓存会导致后续请求直接失败）；
+- 上游 400 原文现在会打进日志（`[image] 上游返回 400 原文：...`），不再只有二手的友好文案。
+
+### 验证
+
+| 项 | 结果 |
+|---|---|
+| 假上游复现（报文取真实平台的原文） | 压缩冲突 → 自动剔除 output_compression 后成功；GIF → 自动缩到 912×912 后成功，且只多一次往返 |
+| 拒绝缓存 | `size` / `frame_count` 均未进入 `IMAGE_PARAM_REJECT_CACHE` |
+| 文案分类 | GIF 报文不再出现「最大像素限制」；真正的尺寸枚举错误与用户自选超大尺寸仍报尺寸 |
+| 真实平台 | `size=912x912 + output_format=gif` → 200，返回 GIF89a 内容；`size=512x512 + gif` → 200；`svg` → 200 |
+| 单测 | 26/26 通过（参数组装、格式纠正、后缀嗅探、压缩冲突识别、尺寸反推、文案分类） |
+
+> 代价说明：本次排障向该平台发了 9 次请求，其中 4 次成功出图（计费），5 次被 400 拒绝（不计费）。
+

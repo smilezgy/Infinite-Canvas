@@ -224,9 +224,10 @@
                             </label>
                             <label class="size-field" id="gifFrameField" style="display:none">
                                 <select id="frameCountSelect" class="size-select" onchange="setFrameCount(this.value)" title="GIF 帧数">
-                                    <option value="9">GIF 帧数：9</option>
-                                    <option value="4">GIF 帧数：4</option>
+                                    <option value="4" selected>GIF 帧数：4</option>
+                                    <option value="2">GIF 帧数：2</option>
                                     <option value="6">GIF 帧数：6</option>
+                                    <option value="9">GIF 帧数：9</option>
                                     <option value="12">GIF 帧数：12</option>
                                     <option value="16">GIF 帧数：16</option>
                                 </select>
@@ -256,6 +257,9 @@
                                     <option value="high">保真：高（贴合原图）</option>
                                 </select>
                             </label>
+                        </div>
+                        <div id="gifHint" style="display:none;margin-top:6px;font-size:10px;line-height:1.6;color:#94a3b8;">
+                            GIF 会把每一帧拼成一张大图再编码，尺寸越大越容易超出平台的像素预算；多数平台还会忽略「GIF 帧数」，真失败时请把画布调小（例如 512x512）。
                         </div>
                     </div>
                 </div>
@@ -487,7 +491,7 @@
 
         // ---- gpt-image-2 / 2.6 输出控制：透明背景 / 格式 / 压缩 / 复杂度 / GIF / 编辑保真 ----
         let outputFormat = '', outputBackground = '', outputCompression = 90, inputFidelity = '';
-        let outputComplexity = '', frameCount = 9, frameDurationMs = 200;
+        let outputComplexity = '', frameCount = 4, frameDurationMs = 200;
         function isGptImageModel(name){ return /gpt-image/i.test(String(name || '')); }
         // gpt-image-2.5 / 2.6 系列：官方新增 complexity 与 xhigh/max 质量档，
         // 并支持 SVG（矢量）与 GIF（动图）输出。判定规则与后端 is_gpt_image_new_series 保持一致。
@@ -554,6 +558,8 @@
             if(gifDurationField) gifDurationField.style.display = isGif ? '' : 'none';
             const frameDurationSel = document.getElementById('frameDurationSelect');
             if(frameDurationSel) frameDurationSel.value = String(frameDurationMs);
+            const gifHint = document.getElementById('gifHint');
+            if(gifHint) gifHint.style.display = isGif ? '' : 'none';
             // 编辑保真只在带了参考图时才有意义；gpt-image-2 及以后官方已移除该字段，直接隐藏
             const hasRefs = Object.values(refs || {}).some(Boolean);
             const fidField = document.getElementById('fidelityField');
@@ -814,10 +820,10 @@
             updateOutputPanel();
         }
 
-        const OUTPUT_PARAM_LABELS = { input_fidelity:'编辑保真', output_format:'输出格式', output_compression:'压缩质量', background:'背景', quality:'质量', n:'数量', complexity:'复杂度', frame_count:'GIF 帧数', frame_duration_ms:'帧时长' };
+        const OUTPUT_PARAM_LABELS = { input_fidelity:'编辑保真', output_format:'输出格式', output_compression:'压缩质量', background:'背景', quality:'质量', n:'数量', complexity:'复杂度', frame_count:'GIF 帧数', frame_duration_ms:'帧时长', size:'尺寸' };
         function ignoredNotice(list){
             const names = list.map(k => OUTPUT_PARAM_LABELS[k] || k).join('、');
-            return `该平台把此模型映射到了能力更少的版本，上游不支持「${names}」，本次已自动忽略这项设置，其余参数照常生效。`;
+            return `该平台对「${names}」有额外限制（可能把模型映射到了能力更少的版本），本次已自动调整该设置，其余参数照常生效。`;
         }
         function showSoftNotice(text){
             let box = document.getElementById('softNotice');
