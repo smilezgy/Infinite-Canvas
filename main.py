@@ -9979,6 +9979,34 @@ def gif_frame_budget_fix(text, params):
     return GIF_FRAME_BUDGET_SAFE_COUNT
 
 
+def gpt_size_below_minimum_fix(text, size):
+    """上游报“尺寸低于最小像素预算”时，按比例放大到可用下限。
+
+    实测报文（newapi 类中转）：
+        "Invalid size '512x512'. Requested resolution is below the current minimum pixel budget."
+    平台与官方一致地要求总像素 ≥ GPT_IMAGE2_MIN_PIXELS（655,360，约 816x816）：
+    实测 768x768（59 万）被拒、896x896（80 万）通过。
+    400 表示请求被拒、尚未生成也不计费，所以放大后重试是安全的。
+    """
+    lower = str(text or "").lower()
+    if not any(token in lower for token in (
+        "below the current minimum", "minimum pixel", "minimum resolution",
+        "too small", "smaller than the minimum",
+    )):
+        return None
+    width, height = parse_size_pair(size)
+    if not width or not height:
+        return None
+    if width * height >= GPT_IMAGE2_MIN_PIXELS:
+        return None
+    grow = (GPT_IMAGE2_MIN_PIXELS / max(1, width * height)) ** 0.5
+    new_width = max(16, int((width * grow + 15) // 16) * 16)
+    new_height = max(16, int((height * grow + 15) // 16) * 16)
+    if new_width == width and new_height == height:
+        return None
+    return f"{new_width}x{new_height}"
+
+
 def gif_size_budget_fix(text, size):
     """GIF 拼版超出平台限制时，按报文反推出能放得下的单帧尺寸。
 
@@ -10069,6 +10097,15 @@ async def send_with_optional_param_retry(send, params, candidates=OPTIONAL_IMAGE
                         dropped.append("size")
                     rounds += 1
                     print(f"[image] {label or model} GIF 拼版超出平台像素预算，已缩小尺寸到 {new_size} 重试（第 {rounds} 次）")
+                    response = await send(current)
+                    continue
+                bigger = gpt_size_below_minimum_fix(body, current.get("size"))
+                if bigger:
+                    current["size"] = bigger
+                    if "size" not in dropped:
+                        dropped.append("size")
+                    rounds += 1
+                    print(f"[image] {label or model} 尺寸低于平台最小像素要求，已放大到 {bigger} 重试（第 {rounds} 次）")
                     response = await send(current)
                     continue
                 break
@@ -10259,6 +10296,18 @@ def gpt_image_2_size_exceeds_supported(size):
     width, height = parse_size_pair(size)
     return bool(width and height and (max(width, height) > GPT_IMAGE2_MAX_EDGE or width * height > GPT_IMAGE2_MAX_PIXELS))
 
+
+def gpt_image_2_size_too_small_message(size):
+    """尺寸低于平台最小像素预算时的提示（与超限提示方向相反，别混用）。"""
+    display_size = size or "未指定"
+    # 满足下限的最小 16 倍数边长：ceil(sqrt(MIN)/16)*16（800x800 仍不够，816x816 够）
+    side = math.ceil((GPT_IMAGE2_MIN_PIXELS ** 0.5) / 16) * 16
+    return (
+        f"当前尺寸 {display_size} 太小：该平台要求总像素不低于 {GPT_IMAGE2_MIN_PIXELS:,}"
+        f"（约 {side}x{side}，边长需 16 的倍数）。请把尺寸调大到 {side}x{side} 或更大，"
+        "或改用其它模型。"
+    )
+
 def apimart_size_resolution(size):
     width, height = parse_size_pair(size)
     if not width or not height:
@@ -10372,6 +10421,13 @@ def friendly_image_error_detail(text, size="", model=""):
         )
     if is_gpt_image_2_model(model) and gpt_image_2_size_exceeds_supported(size):
         return gpt_image_2_size_error_message(size)
+    # 尺寸**低于**平台下限：与超限是相反方向，必须分开提示，
+    # 否则会出现「提示最大像素限制、实际是太小」这种误导。
+    if any(token in lower_text for token in (
+        "below the current minimum", "minimum pixel", "minimum resolution",
+        "too small", "smaller than the minimum",
+    )):
+        return gpt_image_2_size_too_small_message(size)
     mentions_size = any(token in lower_text for token in ["size", "resolution", "dimension"])
     # 报文里若出现了与我们请求不同的具体尺寸，那是平台自己尝试的拼版/换算尺寸，
     # 不能当成“用户选的尺寸非法”，否则会给出完全误导的提示。
@@ -11939,6 +11995,9 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
             params = dict(output_options or {})
             if quality:
                 params.setdefault("quality", quality)
+            # size 放进 params：这样重试机制才能按上游的尺寸报错调整它
+            # （multipart 的字段最终以 params 里的为准，会覆盖下面 data 的初始值）
+            params.setdefault("size", size)
             return params
 
         async def post_openai_edits(edit_files=None, params=None):
@@ -14821,6 +14880,16 @@ async def build_online_image_result(payload: OnlineImageRequest):
 
     local_urls = [url for urls, _items, _raw in generated for url in (urls or []) if url]
     local_items = [item for _urls, items, _raw in generated for item in (items or []) if item.get("url")]
+    # 平台可能**静默忽略** output_format（实测 newapi 只认 png/gif，选 webp 或 svg 仍返回 png，
+    # 且不报错）。用落盘的真实后缀对照请求格式，不一致就如实告知用户，
+    # 否则用户会以为拿到了 WebP/SVG，实际文件却是 PNG。
+    requested_format = str((output_options or {}).get("output_format") or "").strip().lower()
+    if requested_format and local_items:
+        actual_ext = os.path.splitext(str(local_items[0].get("name") or ""))[1].lstrip(".").lower()
+        actual_format = "jpeg" if actual_ext == "jpg" else actual_ext
+        if actual_format and actual_format != requested_format:
+            note_ignored_params(ignored_params, ["output_format"])
+            print(f"[image] 平台未采纳 output_format={requested_format}，实际返回 {actual_format}")
     raw = generated[0][2] if generated else {}
     # 实际生效的参数：GIF 场景可能被自动缩小过尺寸，这里以生效值为准记录
     applied = raw.get("_applied_params") if isinstance(raw, dict) else None

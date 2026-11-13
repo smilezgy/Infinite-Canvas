@@ -497,4 +497,46 @@ Invalid size '2048x4096'. The longest edge ...
 > 该平台 GIF 的可用上限（单帧 < 1024）是它自己的实现，不适用于所有平台；
 > 我们的做法是「失败后按报文反推并自动缩小」，不硬编码任何平台专属阈值。
 
+### 补充二：尺寸**下限**报错被说成「最大像素限制」（2026-11-13 续）
+
+用户在 SVG 场景又撞到一次：
+
+```
+Invalid size '512x512'. Requested resolution is below the current minimum pixel budget.
+```
+
+界面却提示「GPT-Image-2 不支持当前尺寸 512x512：它有最大像素限制（长边最大 3840、总像素约 829 万）」——
+**方向完全说反**：平台嫌尺寸太小，提示却说太大。
+
+### 实测该平台的尺寸下限
+
+| 尺寸 | 总像素 | 结果 |
+|---|---|---|
+| 512x512 | 262,144 | 400 |
+| 768x768 | 589,824 | 400 |
+| 896x896 | 802,816 | 200 |
+| 1024x1024 | 1,048,576 | 200 |
+
+→ 下限与项目已有的 `GPT_IMAGE2_MIN_PIXELS = 655,360` 吻合（约 816x816）。
+
+### 改动
+
+| 改动 | 说明 |
+|---|---|
+| `gpt_image_2_size_too_small_message()` | 新增下限专用文案：说明要求总像素不低于 655,360（约 816x816），方向与超限提示分开 |
+| `friendly_image_error_detail()` | 识别 `below the current minimum` / `minimum pixel` / `too small` 等措辞 → 走下限文案，不再落入「最大像素限制」 |
+| `gpt_size_below_minimum_fix()` | 尺寸过小时按比例放大到 16 倍数的可用下限（512x512 → 816x816）并重试一次（400 未生成、不计费，安全） |
+| `default_edit_params()` | 把 size 放进 params，使 edits（multipart）链路也能被重试机制调整尺寸 |
+| 输出格式如实核对 | 平台**静默忽略** `output_format`（实测：选 webp 或 svg 都返回 png，且不报错）。现在用落盘的真实后缀对照请求格式，不一致就写进 `ignored_params`，前端提示「该平台不支持所选输出格式」，避免用户以为拿到了 SVG 实际是 PNG |
+
+### 验证
+
+| 项 | 结果 |
+|---|---|
+| 单测 | 放大换算（512/768 → 816x816，1024 不动）、文案方向、端到端自动放大重试，全部通过 |
+| 真实平台 SVG + 512x512 | 200，日志「尺寸低于平台最小像素要求，已放大到 816x816 重试」；历史 `size=816x816`、`requested_size=512x512` |
+| 输出格式核对 | 同一请求返回 PNG，`ignored_params = ['size', 'output_format']`，日志「平台未采纳 output_format=svg，实际返回 png」 |
+| edits 回归 | 1024x1024 + 参考图 + complexity → 200，multipart 正常 |
+
+
 
