@@ -14946,32 +14946,21 @@ async def build_online_image_result(payload: OnlineImageRequest):
 
     local_urls = [url for urls, _items, _raw in generated for url in (urls or []) if url]
     local_items = [item for _urls, items, _raw in generated for item in (items or []) if item.get("url")]
-    # 平台可能**静默忽略** output_format（实测某些中转会丢掉该字段，返回 PNG 且不报错）。
-    # 用落盘的真实后缀对照请求格式。渠道不支持所选格式时**直接报错**，
-    # 不静默替换成别的格式交付：用户选了 SVG 却拿到 PNG，即使提示了也已
-    # 产生费用并落盘，而错格式的产物在后续编辑链路里往往不可用。
+    # 渠道可能**静默忽略** output_format（实测某些中转会丢掉该字段，返回 PNG 且不报错）。
+    # 用落盘的真实后缀对照请求格式，不一致就如实告知用户实际拿到的是什么。
+    #
+    # 注意：**产物照常交付**，不因格式不符就丢弃——上游已经生成并计费了，
+    # 丢掉等于白花钱；而错格式的文件用户自己能看到，也能拿去用。
+    # 这里只负责把「所选格式 ≠ 实际格式」这件事如实告诉用户。
     requested_format = str((output_options or {}).get("output_format") or "").strip().lower()
     actual_format = ""
+    format_mismatch = None
     if requested_format and local_items:
         actual_ext = os.path.splitext(str(local_items[0].get("name") or ""))[1].lstrip(".").lower()
         actual_format = "jpeg" if actual_ext == "jpg" else actual_ext
         if actual_format and actual_format != requested_format:
             print(f"[image] 渠道未采纳 output_format={requested_format}，实际返回 {actual_format}")
-            provider_name = provider.get("name") or provider["id"]
-            want_label = {"png": "PNG", "jpeg": "JPEG", "webp": "WebP",
-                          "svg": "SVG", "gif": "GIF"}.get(requested_format, requested_format.upper())
-            got_label = {"png": "PNG", "jpeg": "JPEG", "webp": "WebP",
-                         "svg": "SVG", "gif": "GIF"}.get(actual_format, actual_format.upper())
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"渠道「{provider_name}」不支持「{want_label}」输出格式，已按你的设置原样提交，"
-                    f"但该渠道返回的是 {got_label}，与所选格式不符，因此未返回该结果。\n"
-                    "建议：① 把输出格式改成 PNG 或 WebP；"
-                    "② 或换一个支持该格式的渠道。\n"
-                    "提示：输出格式属于产物形态，不做自动降级，避免拿到与预期不符的图片。"
-                ),
-            )
+            format_mismatch = {"requested": requested_format, "actual": actual_format}
     raw = generated[0][2] if generated else {}
     # 实际生效的参数：GIF 场景可能被自动缩小过尺寸，这里以生效值为准记录
     applied = raw.get("_applied_params") if isinstance(raw, dict) else None
@@ -14991,7 +14980,7 @@ async def build_online_image_result(payload: OnlineImageRequest):
         "provider_name": provider.get("name") or provider["id"],
         "task_id": extract_task_id(raw) if isinstance(raw, dict) else None,
         "request_id": raw.get("id") if isinstance(raw, dict) else None,
-        "params": {"provider_id": provider["id"], "model": model, "size": effective_size, "requested_size": payload.size, "quality": payload.quality, "n": count, "reference_images": refs, "output_options": output_options, "ignored_params": ignored_params, "actual_format": actual_format, "requested_format": requested_format},
+        "params": {"provider_id": provider["id"], "model": model, "size": effective_size, "requested_size": payload.size, "quality": payload.quality, "n": count, "reference_images": refs, "output_options": output_options, "ignored_params": ignored_params, "actual_format": actual_format, "requested_format": requested_format, "format_mismatch": format_mismatch},
         "raw_usage": raw.get("usage") if isinstance(raw, dict) else None,
     }
     save_to_history(result)

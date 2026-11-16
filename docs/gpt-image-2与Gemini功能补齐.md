@@ -624,6 +624,49 @@ Invalid size '512x512'. Requested resolution is below the current minimum pixel 
 
 > 计数：本次验证向 3 个平台发了 8 次请求，6 次成功出图（计费）、1 次格式不支持被拒、1 次模型通道不可用。
 
+## 十五、格式不符：产物照收 + 如实提示
+
+### 需求
+
+> 如果上游渠道返回的 png 图，不是 svg，那么按上游返回接受，不然费用也花了，
+> 所以这种情况下，请求参数是 svg 图，渠道返回的不是，那么就发出提示消息：上游返回的非 svg 图。
+
+上一节改成「格式不符直接抛 400」是错的：**上游已经生成并计费了**，抛错等于把
+已经花钱生成的产物直接丢弃，用户既没拿到图也没得到解释。
+
+### 最终行为矩阵
+
+| 上游表现 | 是否出图 | 系统行为 |
+|---|---|---|
+| 200，返回的就是所选格式 | 是 | 正常返回，无提示 |
+| **200，但返回的是别的格式** | **是（已计费）** | **正常交付产物 + 提示「你选了 SVG，上游实际返回的是 PNG」** |
+| 400，明确拒绝该格式 | 否（未计费） | 直接报错，不重试、不降级 |
+
+「不降级」这条不变：请求体始终带用户所选的 `output_format`，绝不偷偷改成别的格式。
+
+### 改动
+
+| 改动 | 说明 |
+|---|---|
+| `build_online_image_result()` | 格式不符时**不再抛 400**，改为记录 `format_mismatch = {requested, actual}` 并正常返回产物 |
+| `params.format_mismatch` | 新增字段，标记所选格式与实际格式；一致时为 `None` |
+| `params.requested_format` / `actual_format` | 保留，如实记录 |
+| 前端 `formatMismatchNotice()` | 新增提示文案：「你选择了 {X} 格式，但上游实际返回的是 {Y}（产物已按上游实际结果交付）。如需 {X}，请换一个支持该格式的渠道。」 |
+| 前端 `showFormatMismatchBox()` | 新增琥珀色浮层（不是错误红 —— 结果可用，只是与预期不同） |
+| 前端防御 | `formatMismatchNotice()` 内置「格式一致则不提示」判断，避免误报 |
+
+### 验证
+
+| 项 | 结果 |
+|---|---|
+| 假上游五场景 | 上游 400 拒 svg → 400 报错、**只请求 1 次**、请求体带 svg；上游 200 返 PNG（请求 gif）→ 200 交付产物 + `format_mismatch={'requested':'gif','actual':'png'}`；请求 webp 返回真 WebP → 200 无 mismatch；png → png → 200 无 mismatch；请求体始终带 `output_format` |
+| 前端文案 | 无头浏览器驱动：SVG→PNG、GIF→PNG、WebP→JPEG 三种组合文案正确；无 mismatch 与格式一致两种情况**不提示** |
+| 真实平台 4stoken（custom-api-5） | svg → **HTTP 200**，产物 `/assets/output/online_*.png` 已交付，`format_mismatch={'requested':'svg','actual':'png'}`，日志「渠道未采纳 output_format=svg，实际返回 png」 |
+| 真实平台 Grsai（custom-api-2） | svg（扁平图标提示词）→ 200，产物为**真 SVG**，`format_mismatch=None` |
+
+> 计数：本次验收 2 次出图（均计费）。
+
+
 
 
 
