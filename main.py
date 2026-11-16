@@ -9870,12 +9870,15 @@ def gpt_image_supports_input_fidelity(model):
     compact = re.sub(r"[^a-z0-9]+", "", str(model or "").strip().lower())
     return not compact.startswith("gptimage2")
 
-# 可以安全“删掉再试”的可选参数：它们只影响输出偏好，缺失时上游会走默认值。
+# 可以安全"删掉再试"的可选参数：它们只影响输出偏好，缺失时上游会走默认值。
 # 注意不包含 model / prompt / size / image 等必需字段。
+#
+# output_format **不在这里**：输出格式是用户明确选择的产物形态，不是偏好参数。
+# 渠道不支持时应当直接报错，而不是悄悄换一种格式出图（那会让用户拿到与预期
+# 不符的文件却毫无察觉）。size / frame_count 同理，不参与格式降级。
 OPTIONAL_IMAGE_PARAMS = (
     "input_fidelity",
     "output_compression",
-    "output_format",
     "background",
     "quality",
     "n",
@@ -9896,7 +9899,8 @@ _UNSUPPORTED_PARAM_PATTERNS = (
 # 有些上游按**格式值**报错，一个参数名都不给，例如实测报文：
 #   "SVG output is not available in this key's group (per-call route).
 #    Create a key with OpenAI Official as its group ..."
-# 这类措辞靠上面的正则一个都匹配不上，只能把格式值映射回 output_format。
+# 这类措辞靠上面的正则一个都匹配不上。用它来识别「是哪个格式不被支持」，
+# 目的是给出准确的报错文案，而不是把格式参数降级掉。
 _FORMAT_VALUE_UNSUPPORTED_PATTERNS = (
     re.compile(r"\b(svg|gif|webp)\s+(?:output|format|image)\b[^.]{0,80}?\b(?:not\s+available|not\s+supported|unavailable|not\s+enabled)\b", re.I),
     re.compile(r"\b(?:not\s+available|not\s+supported|unavailable)\b[^.]{0,40}?\b(svg|gif|webp)\s+(?:output|format|image)\b", re.I),
@@ -9912,41 +9916,43 @@ _FORMAT_VALUE_PARAM_MAP = {
 # 记录「某平台某模型明确拒绝过哪些可选参数」，避免每次生成都先撞一次 400。
 # 键为 (provider_id, model)，只在进程内有效；映射关系变化时重启即可清空。
 IMAGE_PARAM_REJECT_CACHE = {}
-# output_format 的拒绝按**格式值**记录：平台不支持 SVG，不代表不支持 WebP。
-# 键为 (provider_id, model, format)。
-REJECTED_OUTPUT_FORMATS = set()
 
 
 def unsupported_request_params(text, candidates=OPTIONAL_IMAGE_PARAMS):
     """从上游 400 报文里解析出“不支持”的参数名，只返回调用方允许剔除的字段。"""
     allowed = {str(name).lower() for name in (candidates or ())}
     found = []
-    body = str(text or "")
     for pattern in _UNSUPPORTED_PARAM_PATTERNS:
-        for name in pattern.findall(body):
+        for name in pattern.findall(str(text or "")):
             key = str(name).strip().lower()
-            if key in allowed and key not in found:
-                found.append(key)
-    if found:
-        return found
-    # 报文一个参数名都没给时，退而按格式值识别（如 "SVG output is not available ..."）。
-    for pattern in _FORMAT_VALUE_UNSUPPORTED_PATTERNS:
-        for fmt in pattern.findall(body):
-            key = _FORMAT_VALUE_PARAM_MAP.get(str(fmt).strip().lower())
             if key in allowed and key not in found:
                 found.append(key)
     return found
 
 
+def unsupported_output_format(text):
+    """从报错里识别出「是哪个输出格式不被支持」，用于生成准确的提示文案。
+
+    只用于**报错提示**，不参与降级：格式不支持时应当直接报错返回，
+    而不是悄悄换个格式出图。识别不出时返回空串。
+    """
+    body = str(text or "")
+    for pattern in _FORMAT_VALUE_UNSUPPORTED_PATTERNS:
+        found = pattern.findall(body)
+        if found:
+            value = str(found[0]).strip().lower()
+            if value in _FORMAT_VALUE_PARAM_MAP:
+                return value
+    # 报文点名了 output_format 但没说格式值时，只能确认是格式问题
+    if re.search(r"output[_ ]format", body, re.I):
+        return ""
+    return None
+
+
+
 def known_rejected_params(provider_id, model, output_format=""):
     key = (str(provider_id or ""), str(model or "").strip().lower())
-    rejected = set(IMAGE_PARAM_REJECT_CACHE.get(key) or ())
-    # output_format 的拒绝是**按格式值**的：平台不支持 SVG，不代表不支持 WebP。
-    # 这类拒绝记在单独的表里（键含具体格式值），避免把整个字段永久禁掉。
-    fmt = str(output_format or "").strip().lower()
-    if fmt and (key[0], key[1], fmt) in REJECTED_OUTPUT_FORMATS:
-        rejected.add("output_format")
-    return rejected
+    return set(IMAGE_PARAM_REJECT_CACHE.get(key) or ())
 
 
 def remember_rejected_params(provider_id, model, dropped, output_format=""):
@@ -9954,16 +9960,12 @@ def remember_rejected_params(provider_id, model, dropped, output_format=""):
         return
     # frame_count / size 属于「被自动调小」而不是「不被支持」，不能记进拒绝缓存：
     # 否则以后所有请求都不带它们（size 更是必需参数），反而直接失败。
+    # output_format 同样不记：格式不支持时应当直接报错，而不是让后续请求
+    # 悄悄不带这个参数（用户会拿到与所选格式不符的结果而毫无察觉）。
     key = (str(provider_id or ""), str(model or "").strip().lower())
-    normal = [name for name in dropped if name not in {"frame_count", "size", "output_format"}]
-    if normal:
-        IMAGE_PARAM_REJECT_CACHE.setdefault(key, set()).update(normal)
-    if "output_format" in dropped:
-        # 只记住「这个具体格式不被支持」，不影响同模型的其他格式。
-        fmt = str(output_format or "").strip().lower()
-        if fmt:
-            REJECTED_OUTPUT_FORMATS.add((key[0], key[1], fmt))
-            print(f"[image] {provider_id}/{model} 记住该平台不支持 output_format={fmt}")
+    IMAGE_PARAM_REJECT_CACHE.setdefault(key, set()).update(
+        name for name in dropped if name not in {"frame_count", "size", "output_format"}
+    )
 
 
 def note_ignored_params(notes, dropped):
@@ -10433,45 +10435,43 @@ def normalize_volcengine_size(size, model=""):
             break
     return f"{snapped_w}x{snapped_h}"
 
-def _requested_format_hint(text):
-    """从报错里指出是哪个输出格式被拒（如 "SVG"），用于给用户可执行的下一步。"""
-    body = str(text or "")
-    for pattern in _FORMAT_VALUE_UNSUPPORTED_PATTERNS:
-        found = pattern.findall(body)
-        if found:
-            value = str(found[0]).strip().lower()
-            return {"svg": "SVG", "gif": "GIF", "webp": "WebP"}.get(value, value.upper())
-    return "所选格式"
-
-
 def friendly_image_error_detail(text, size="", model=""):
     text = str(text or "")
     lower_text = text.lower()
+    # 输出格式不被支持：这类错误**不做降级**，直接报错返回。
+    # 降级会让用户拿到与所选格式不符的产物（如选了 SVG 却得到 PNG），
+    # 而产物已经生成并计费，静默替换比报错更糟。
+    fmt = unsupported_output_format(text)
+    if fmt is not None:
+        label = {"svg": "SVG", "gif": "GIF", "webp": "WebP"}.get(fmt, fmt.upper())
+        if fmt:
+            return (
+                f"该渠道不支持「{label}」输出格式，已按你的设置原样提交，未做任何降级。\n"
+                "这类限制通常来自 API Key 的分组权限，不同分组开放的能力不同。\n"
+                "建议：① 把输出格式改成 PNG 或 WebP；"
+                "② 或在平台后台把 Key 切到开放该格式的分组后重试。"
+                f"原始报错：{text[:200]}"
+            )
+        return (
+            "该渠道不支持所选的输出格式，已按你的设置原样提交，未做任何降级。\n"
+            "建议：把输出格式改成 PNG 或 WebP，或换一个支持该格式的渠道。"
+            f"原始报错：{text[:200]}"
+        )
     # 上游明确点名“不支持某参数”：多为平台做了模型映射（别名 → 能力更少的实际模型）。
     # 调用侧已自动剔除重试，走到这里说明去掉参数后仍未成功。
     unsupported = unsupported_request_params(text, OPTIONAL_IMAGE_PARAMS)
     if unsupported:
-        # 输出格式不可用（key 分组 / 平台能力限制）要单独说清楚，给出可执行的下一步。
-        if "output_format" in unsupported:
-            return (
-                f"该平台不支持所选的输出格式（{_requested_format_hint(text)}）："
-                "这类限制通常来自 API Key 的分组权限，不同分组开放的能力不同。\n"
-                "系统已自动去掉该设置重试，但本次仍未成功。建议："
-                "① 把输出格式改成 PNG 或 WebP；"
-                "② 或在平台后台把 Key 切到开放该格式的分组后重试。"
-                f"原始报错：{text[:160]}"
-            )
         names = "、".join(unsupported)
         return (
             f"上游模型不支持参数「{names}」：该平台很可能把模型映射到了能力更少的版本。"
-            f"系统已自动去掉该参数重试，但本次仍未成功，请关闭对应的输出选项（透明背景 / 输出格式 / 编辑保真）后再生成。"
+            f"系统已自动去掉该参数重试，但本次仍未成功，请关闭对应的输出选项（透明背景 / 编辑保真）后再生成。"
             f"原始报错：{text[:160]}"
         )
     # 平台静默丢弃了 output_format（实际按 PNG 处理），PNG 又不接受小于 100 的压缩率。
     if "compression" in lower_text and any(t in lower_text for t in ("not supported", "unsupported", "invalid")):
         return (
-            "该平台忽略了「输出格式」设置，实际仍按 PNG 输出，而 PNG 不接受小于 100 的压缩率。"
-            "系统已自动去掉压缩参数重试；若必须拿到 WebP/JPEG，请换一个支持输出格式的平台，"
+            "该渠道忽略了「输出格式」设置，实际仍按 PNG 输出，而 PNG 不接受小于 100 的压缩率。"
+            "系统已自动去掉压缩参数重试；若必须拿到 WebP/JPEG，请换一个支持输出格式的渠道，"
             f"或把压缩质量调到 100。原始报错：{text[:160]}"
         )
     # GIF 动图：平台把所有帧拼进一张 sheet 再编码，尺寸大了就超出像素预算。
@@ -14947,29 +14947,31 @@ async def build_online_image_result(payload: OnlineImageRequest):
     local_urls = [url for urls, _items, _raw in generated for url in (urls or []) if url]
     local_items = [item for _urls, items, _raw in generated for item in (items or []) if item.get("url")]
     # 平台可能**静默忽略** output_format（实测某些中转会丢掉该字段，返回 PNG 且不报错）。
-    # 用落盘的真实后缀对照请求格式，不一致就如实告知用户，
-    # 否则用户会以为拿到了 WebP/SVG，实际文件却是 PNG。
-    #
-    # 这与「上游 400 拒绝参数 → 我们剔除后重试」是两种**性质不同**的情况：
-    #   · 静默忽略：平台收下了请求却不执行该设置，产物与用户的选择不符；
-    #   · 主动降级：我们自己丢掉一个可选参数后重试并成功出图。
-    # 两者都可能以 output_format 出现，靠“最终格式是否等于所选格式”无法区分，
-    # 因为降级后平台本来就只给 PNG。因此这里按**实际发生的路径**分类：
-    #   dropped_by_platform —— 请求原样送达，平台自己没执行（静默忽略）
-    #   dropped_by_us       —— 上游明确拒绝，我们剔除后重试成功（主动降级）
+    # 用落盘的真实后缀对照请求格式。渠道不支持所选格式时**直接报错**，
+    # 不静默替换成别的格式交付：用户选了 SVG 却拿到 PNG，即使提示了也已
+    # 产生费用并落盘，而错格式的产物在后续编辑链路里往往不可用。
     requested_format = str((output_options or {}).get("output_format") or "").strip().lower()
-    unsupported_params = []
     actual_format = ""
     if requested_format and local_items:
         actual_ext = os.path.splitext(str(local_items[0].get("name") or ""))[1].lstrip(".").lower()
         actual_format = "jpeg" if actual_ext == "jpg" else actual_ext
         if actual_format and actual_format != requested_format:
-            # 若该参数是我们主动剔除后重试的，就归入「主动降级」，不重复报「平台未采纳」。
-            if "output_format" not in ignored_params:
-                unsupported_params.append("output_format")
-                print(f"[image] 平台未采纳 output_format={requested_format}，实际返回 {actual_format}")
-            else:
-                print(f"[image] output_format={requested_format} 已被上游拒绝，已降级为 {actual_format}")
+            print(f"[image] 渠道未采纳 output_format={requested_format}，实际返回 {actual_format}")
+            provider_name = provider.get("name") or provider["id"]
+            want_label = {"png": "PNG", "jpeg": "JPEG", "webp": "WebP",
+                          "svg": "SVG", "gif": "GIF"}.get(requested_format, requested_format.upper())
+            got_label = {"png": "PNG", "jpeg": "JPEG", "webp": "WebP",
+                         "svg": "SVG", "gif": "GIF"}.get(actual_format, actual_format.upper())
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"渠道「{provider_name}」不支持「{want_label}」输出格式，已按你的设置原样提交，"
+                    f"但该渠道返回的是 {got_label}，与所选格式不符，因此未返回该结果。\n"
+                    "建议：① 把输出格式改成 PNG 或 WebP；"
+                    "② 或换一个支持该格式的渠道。\n"
+                    "提示：输出格式属于产物形态，不做自动降级，避免拿到与预期不符的图片。"
+                ),
+            )
     raw = generated[0][2] if generated else {}
     # 实际生效的参数：GIF 场景可能被自动缩小过尺寸，这里以生效值为准记录
     applied = raw.get("_applied_params") if isinstance(raw, dict) else None
@@ -14989,7 +14991,7 @@ async def build_online_image_result(payload: OnlineImageRequest):
         "provider_name": provider.get("name") or provider["id"],
         "task_id": extract_task_id(raw) if isinstance(raw, dict) else None,
         "request_id": raw.get("id") if isinstance(raw, dict) else None,
-        "params": {"provider_id": provider["id"], "model": model, "size": effective_size, "requested_size": payload.size, "quality": payload.quality, "n": count, "reference_images": refs, "output_options": output_options, "ignored_params": ignored_params, "unsupported_params": unsupported_params, "actual_format": actual_format, "requested_format": requested_format},
+        "params": {"provider_id": provider["id"], "model": model, "size": effective_size, "requested_size": payload.size, "quality": payload.quality, "n": count, "reference_images": refs, "output_options": output_options, "ignored_params": ignored_params, "actual_format": actual_format, "requested_format": requested_format},
         "raw_usage": raw.get("usage") if isinstance(raw, dict) else None,
     }
     save_to_history(result)

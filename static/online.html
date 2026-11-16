@@ -821,36 +821,11 @@
         }
 
         const OUTPUT_PARAM_LABELS = { input_fidelity:'编辑保真', output_format:'输出格式', output_compression:'压缩质量', background:'背景', quality:'质量', n:'数量', complexity:'复杂度', frame_count:'GIF 帧数', frame_duration_ms:'帧时长', size:'尺寸' };
-        const FORMAT_LABELS = { png:'PNG', jpeg:'JPEG', webp:'WebP', svg:'SVG', gif:'GIF' };
-        function formatLabel(f){ return FORMAT_LABELS[String(f||'').toLowerCase()] || String(f||'').toUpperCase(); }
-        // 平台**静默忽略**某个设置：请求成功出图，但产物与用户选的不一样。
-        // 这种必须说清「实际拿到的是什么」，不能含糊成「已自动调整」。
-        function unsupportedNotice(list, params){
-            const p = params || {};
-            const parts = list.map(k => {
-                if(k === 'output_format'){
-                    const want = formatLabel(p.requested_format);
-                    const got = formatLabel(p.actual_format);
-                    return `「输出格式」选了 ${want}，但该平台不支持，实际返回的是 ${got}`;
-                }
-                return `「${OUTPUT_PARAM_LABELS[k] || k}」该平台不支持`;
-            });
-            return parts.join('；') + '。产物格式与所选不一致，若需该格式请换一个支持的平台。';
-        }
-        // 我们**主动降级**：上游点名拒收某参数，剔除后重试并成功出图。
-        function ignoredNotice(list, params){
-            const p = params || {};
-            const names = list.map(k => {
-                if(k === 'output_format'){
-                    const want = formatLabel(p.requested_format);
-                    return `输出格式 ${want}`;
-                }
-                return OUTPUT_PARAM_LABELS[k] || k;
-            }).join('、');
-            const tail = list.includes('output_format')
-                ? '已自动改用默认格式（PNG）重试，出图成功但不是所选格式'
-                : '可能把模型映射到了能力更少的版本，已自动去掉该设置后重试，其余参数照常生效';
-            return `该平台不支持「${names}」：${tail}。`;
+        // 我们**主动降级**的可选参数：上游点名拒收，剔除后重试并成功出图。
+        // 输出格式不在此列 —— 格式不支持时后端会直接报错，不做降级。
+        function ignoredNotice(list){
+            const names = list.map(k => OUTPUT_PARAM_LABELS[k] || k).join('、');
+            return `该渠道不支持「${names}」（可能把模型映射到了能力更少的版本），已自动去掉该设置后重试，其余参数照常生效。`;
         }
         function showSoftNotice(text){
             let box = document.getElementById('softNotice');
@@ -874,6 +849,30 @@
             box.style.opacity = '1';
             clearTimeout(box._timer);
             box._timer = setTimeout(() => { box.style.opacity = '0'; }, 7000);
+        }
+
+        // 错误提示：后端的报错常带换行与多条建议（如「渠道不支持该输出格式」），
+        // alert 会把换行压成一行，这里用可保留换行的浮层展示。
+        function showErrorBox(text){
+            let box = document.getElementById('errorBox');
+            if(!box){
+                box = document.createElement('div');
+                box.id = 'errorBox';
+                box.style.cssText = [
+                    'position:fixed', 'left:50%', 'bottom:96px', 'transform:translateX(-50%)',
+                    'max-width:min(620px,calc(100vw - 32px))', 'padding:14px 20px',
+                    'border-radius:14px', 'background:rgba(153,27,27,.96)', 'color:#fff',
+                    'font-size:12px', 'line-height:1.8', 'letter-spacing:.02em', 'white-space:pre-wrap',
+                    'box-shadow:0 12px 40px rgba(0,0,0,.32)', 'backdrop-filter:blur(8px)',
+                    'z-index:10000', 'opacity:1', 'transition:opacity .3s ease',
+                    'pointer-events:none', 'max-height:46vh', 'overflow:auto'
+                ].join(';');
+                document.documentElement.appendChild(box);
+            }
+            box.textContent = text;
+            box.style.opacity = '1';
+            clearTimeout(box._timer);
+            box._timer = setTimeout(() => { box.style.opacity = '0'; }, 12000);
         }
 
         async function submitImage(){
@@ -911,17 +910,11 @@
                     body:JSON.stringify(reqBody)
                 }).then(async r => { if(!r.ok) throw new Error((await r.json()).detail || '生成失败'); return r.json(); });
                 currentResult = result; out.src = result.images[0]; out.classList.remove('hidden'); dl.href = result.images[0]; dl.classList.remove('hidden'); renderImageCard(result, true);
-                const params = result.params || {};
-                const unsupported = Array.isArray(params.unsupported_params) ? params.unsupported_params : [];
-                const ignored = Array.isArray(params.ignored_params) ? params.ignored_params : [];
-                const notices = [];
-                // unsupported = 平台收下请求却不执行（静默忽略）；ignored = 我们主动剔除后重试。
-                // 两者互斥，由后端按实际路径分类，前端不再自行去重。
-                if(unsupported.length) notices.push(unsupportedNotice(unsupported, params));
-                if(ignored.length) notices.push(ignoredNotice(ignored, params));
-                if(notices.length) showSoftNotice(notices.join(' '));
+                // 输出格式不支持时后端已直接报错（不做降级），这里只剩可安全降级的偏好参数。
+                const ignored = result.params && result.params.ignored_params;
+                if(Array.isArray(ignored) && ignored.length){ showSoftNotice(ignoredNotice(ignored)); }
             } catch(err) {
-                alert(err.message || 'Generation failed'); placeholder.classList.remove('hidden');
+                showErrorBox(err.message || 'Generation failed'); placeholder.classList.remove('hidden');
             } finally {
                 clearInterval(window.__genTimer);
                 if(elapsedEl) elapsedEl.textContent = '';

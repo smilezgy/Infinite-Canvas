@@ -585,6 +585,46 @@ Invalid size '512x512'. Requested resolution is below the current minimum pixel 
 
 > 计数：本次排障向该平台发了 6 次请求，6 次成功出图（计费）。
 
+## 十四、输出格式不再降级：不支持就直接报错
+
+### 需求
+
+> 需要的是选什么格式就出什么格式的图片。如果渠道不支持，那就直接报错返回就可以，不需要做降级。
+
+上一节的自动降级在这一点上做错了：`output_format` 被当成普通可选参数，上游 400 时被剔除后重试，用户选了 SVG 却拿到 PNG 却毫不知情。更糟的是拒绝缓存把整个 `output_format` 字段禁掉，导致后续请求**连参数都不带**：
+
+```
+[image] custom-api-7/gpt-image-2.6-flare 跳过历史拒绝的参数 ['output_format']
+```
+
+渠道于是报「请求里没有带上 output_format 参数。请在请求体里加 "output_format": "svg"」。
+
+### 改动
+
+| 改动 | 说明 |
+|---|---|
+| `OPTIONAL_IMAGE_PARAMS` | 移除 `output_format`：格式不属于「删掉也能跑的偏好参数」，不进降级白名单 |
+| `remember_rejected_params()` | `output_format` 不再写入拒绝缓存，不会导致后续请求漏掉该参数 |
+| `REJECTED_OUTPUT_FORMATS` | 删除：按格式值记拒绝缓存的机制已无存在意义 |
+| `unsupported_output_format()` | 新增，只用于**识别报错里的格式名**以生成文案，不参与降级 |
+| 格式不符直接报错 | 渠道收下请求却返回别的格式（静默忽略）时，抛 400 并说明「实际返回的是 X，与所选格式不符，因此未返回该结果」 |
+| `friendly_image_error_detail()` | 格式不支持时文案改为「已按你的设置原样提交，未做任何降级」，并给出两条建议（改格式 / 换渠道） |
+| 前端 | 删除 `unsupportedNotice` 与格式降级文案；错误改用 `showErrorBox()` 浮层展示（保留换行，`alert` 会压成一行） |
+
+保留的降级：**GIF 尺寸缩放**仍保留 —— 那是画布大小问题，产物仍是 GIF，不违反「选什么格式出什么格式」。
+
+### 验证
+
+| 项 | 结果 |
+|---|---|
+| 假上游四场景 | 渠道拒 svg → 400、**只请求 1 次**（无重试）、请求体确实带 svg；渠道静默返回 PNG → 400 报错不交付；渠道支持 webp → 200 且请求体带 output_format、无降级标记；拒过 svg 后后续请求仍带 output_format |
+| 真实平台 Grsai（custom-api-2） | svg → 200，产物为真 SVG（4645 字节，`<svg xmlns=...>`）；webp → 200，真 WebP（`RIFF....WEBP`）；gif → 200，真 GIF（`GIF89a`，1024x1024 未缩放）；png → 200，无降级标记 |
+| 真实平台 4stoken（custom-api-5） | svg → 400「渠道「4stoken」不支持「SVG」输出格式…未做任何降级」 |
+| 真实平台 newapi-lkkcdn（custom-api-7） | 模型通道本身不可用（503「找不到模型 gpt-image-2.6-flare 可用通道」），与格式无关 |
+
+> 计数：本次验证向 3 个平台发了 8 次请求，6 次成功出图（计费）、1 次格式不支持被拒、1 次模型通道不可用。
+
+
 
 
 
